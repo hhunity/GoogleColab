@@ -125,7 +125,7 @@ complex_fft_output_3ch[:, :, 1] = f_transform.imag.astype(np.float32)
 complex_fft_output_3ch[:, :, 2] = np.zeros_like(f_transform.real, dtype=np.float32)
 
 # 保存パス
-complex_fft_pfm_path = 'out.pgm_fft_complex.pfm'
+complex_fft_pfm_path = 'out.pgm_fft_opencv.pfm'
 
 # PFMファイルとして保存
 write_pfm(complex_fft_pfm_path, complex_fft_output_3ch)

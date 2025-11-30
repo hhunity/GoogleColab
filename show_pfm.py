@@ -77,25 +77,27 @@ def pfm_open_logmag(pfm_path):
 
 # 画像ファイルのパス
 imori_path = 'imori.pgm'
-pfm_path1 = 'out.pgm_sobel.pfm'
-pfm_path2 = 'out.pgm_fft_complex.pfm'
+pfm_path1 = 'out.pgm_sobel_cuda.pfm'
+pfm_path2 = 'out.pgm_sobel_opencv.pfm'
+pfm_path3 = 'out.pgm_fft_cuda.pfm'
+pfm_path4 = 'out.pgm_fft_opencv.pfm'
 
 try:
     # imori.pgmをオープン
     img_imori = Image.open(imori_path)
-
-    # PFMファイルを読み込み
-    img_out_1 = pfm_open_logmag(pfm_path1)
-    img_out_2 = pfm_open_logmag(pfm_path2)
-    
     # グレースケール画像であることを確認
     if img_imori.mode != 'L':
         img_imori = img_imori.convert('L')
-    # img_outは既に'L'モードで作成されている
+    
+    # PFMファイルを読み込み
+    img_out_1 = pfm_open_logmag(pfm_path1)
+    img_out_2 = pfm_open_logmag(pfm_path2)
+    img_out_3 = pfm_open_logmag(pfm_path3)
+    img_out_4 = pfm_open_logmag(pfm_path4)
 
     # 2つの画像を並べて表示するために、新しい画像を作成
-    total_width = img_imori.width + img_out_1.width + img_out_2.width
-    max_height = max(img_imori.height, img_out_1.height,img_out_1.height)
+    total_width = img_imori.width + img_out_1.width + img_out_2.width+ img_out_3.width + img_out_4.width
+    max_height = max(img_imori.height, img_out_1.height,img_out_2.height,img_out_3.height,img_out_4.height)
 
     # 新しい画像を作成 (モード 'L'はグレースケール)
     combined_img = Image.new('L', (total_width, max_height), color=255) # 背景を白に設定
@@ -104,11 +106,14 @@ try:
     combined_img.paste(img_imori, (0, 0))
     combined_img.paste(img_out_1, (img_imori.width, 0))
     combined_img.paste(img_out_2, (img_imori.width+img_out_1.width, 0))
+    combined_img.paste(img_out_3, (img_imori.width+img_out_1.width+img_out_2.width, 0))
+    combined_img.paste(img_out_4, (img_imori.width+img_out_1.width+img_out_2.width+img_out_3.width, 0))
 
     # 結合した画像を表示
     display(combined_img)
 
-    print(f"'{imori_path}' と '{out_path}' (対数正規化済み) を並べて表示しました。")
+    print(f"'{imori_path}' と '{img_out_1}' '{img_out_2}' '{img_out_3}' '{img_out_4}'を並べて表示しました。")
+
 
 except FileNotFoundError as e:
     print(f"エラー: {e.filename} が見つかりませんでした。ファイルが存在するか、パスが正しいか確認してください。")
