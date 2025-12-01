@@ -59,10 +59,10 @@ pfm_path2 = 'out.pgm_fft_cv.pfm'
 try:
     # PFMファイルを読み込み、処理してlog_magnitude_spectrumを生成
     raw_pfm_data1, is_color1 = read_pfm_to_numpy(pfm_path1)
-    log_mag_spectrum1 = process_pfm_for_magnitude(raw_pfm_data1, False)
+    log_mag_spectrum1 = process_pfm_for_magnitude(raw_pfm_data1, is_color1)
 
     raw_pfm_data2, is_color2 = read_pfm_to_numpy(pfm_path2)
-    log_mag_spectrum2 = process_pfm_for_magnitude(raw_pfm_data2, True)
+    log_mag_spectrum2 = process_pfm_for_magnitude(raw_pfm_data2, is_color2)
 
     # 絶対差を計算
     abs_diff = np.abs(log_mag_spectrum1 - log_mag_spectrum2)

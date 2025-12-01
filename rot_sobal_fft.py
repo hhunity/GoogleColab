@@ -48,13 +48,7 @@ def write_pfm(filename, image_data):
         file.write(image_data.tobytes())
     print(f"Successfully wrote PFM file to {filename}")
 
-# Load the image in grayscale
-image_path = 'imori.pgm'
-img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-
-if img_gray is None:
-    print(f"Error: Could not load image from {image_path}")
-else:
+def create_dft(img_gray):
     # Get image dimensions
     h, w = img_gray.shape[:2]
 
@@ -62,7 +56,7 @@ else:
     center = (0, 0)
     
     # Define the angle for clockwise rotation (-1 degree)
-    angle = -1.0
+    angle = -10.0
 
     # Use cv2.getRotationMatrix2D to create a rotation matrix
     rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -85,49 +79,102 @@ else:
     print(f"Successfully applied 1-degree clockwise rotation, Sobel filters, and calculated gradient magnitude for {image_path}.")
     print(f"Shape of magnitude_sobel: {magnitude_sobel.shape}, Dtype: {magnitude_sobel.dtype}")
 
+    # Get dimensions of magnitude_sobel
+    height, width = magnitude_sobel.shape
 
-# Get dimensions of magnitude_sobel
-height, width = magnitude_sobel.shape
+    # 2Dハン窓をOpenCVで生成（DFT入力サイズに合わせる）
+    hanning_2d = cv2.createHanningWindow((width, height), cv2.CV_32F)
 
-# Generate 1D Hanning windows for height and width
-hanning_h = np.hanning(height)
-hanning_w = np.hanning(width)
+    # OpenCVは(幅, 高さ)の順なので、転置不要でそのまま要素ごとの積
+    windowed_magnitude_sobel = magnitude_sobel.astype(np.float32) * hanning_2d
 
-# Create a 2D Hanning window using outer product
-hanning_2d = np.outer(hanning_h, hanning_w)
+    # 1. OpenCVのDFT（複素2ch）を実行
+    f_transform = cv2.dft(windowed_magnitude_sobel, flags=cv2.DFT_COMPLEX_OUTPUT)
 
-# Multiply magnitude_sobel by the 2D Hanning window
-windowed_magnitude_sobel = magnitude_sobel * hanning_2d
+    return f_transform
 
-# 1. Perform 2D FFT on the windowed_magnitude_sobel array
-f_transform = np.fft.fft2(windowed_magnitude_sobel)
+def save_pfm(corr_shift,filename):
+    # corr_shift が複素2chか実数2Dかで処理を分ける
+    if corr_shift.ndim == 3:
+        # 2ch複素
+        # f_transform_shifted = np.fft.fftshift(corr_shift, axes=(0, 1))
+        # magnitude_spectrum = cv2.magnitude(f_transform_shifted[:, :, 0], f_transform_shifted[:, :, 1])
+        # log_magnitude_spectrum = cv2.log(magnitude_spectrum + epsilon)
 
-# 2. Apply fftshift to center the zero-frequency component
-f_transform_shifted = np.fft.fftshift(f_transform)
+        # 実部・虚部を3chに分離してPFM保存用の配列を作る
+        complex_fft_output_3ch = np.zeros((corr_shift.shape[0], corr_shift.shape[1], 3), dtype=np.float32)
+        complex_fft_output_3ch[:, :, 0] = corr_shift[:, :, 0]  # real
+        complex_fft_output_3ch[:, :, 1] = corr_shift[:, :, 1]  # imag
+        complex_fft_output_3ch[:, :, 2] = 0.0  # ダミー
+        write_pfm(filename, complex_fft_output_3ch)
+        print(f"Complex FFT result saved as 3-channel PFM to {filename}")
+    else:
+        # 実数2D（例: 相関面のidft出力）
+        # f_transform_shifted = np.fft.fftshift(corr_shift, axes=(0, 1))
+        # magnitude_spectrum = np.abs(f_transform_shifted)
+        # log_magnitude_spectrum = np.log(magnitude_spectrum + epsilon)
+        # 実数としてPFMに保存
+        real_pfm_path = 'out.pgm_fft_opencv_real.pfm'
+        write_pfm(filename, corr_shift.astype(np.float32))
+        print(f"Real-valued result saved as PFM to {filename}")
 
-# 3. Calculate the magnitude spectrum
-magnitude_spectrum = np.abs(f_transform_shifted)
+# Load the image in grayscale
+image_path = 'imori.pgm'
+img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
-# 4. Apply a logarithmic scale for better visualization
-epsilon = 1e-6 # Small constant to avoid log(0)
-log_magnitude_spectrum = np.log(magnitude_spectrum + epsilon)
+if img_gray is None:
+    print(f"Error: Could not load image from {image_path}")
+    exit()
+
+f_transform       = create_dft(img_gray)
+
+save_pfm(f_transform,'out.pgm_fft_opencv.pfm')
+
+if 1:
+    # 任意のオフセットでDFT結果をシフトしたコピーを作る（垂直=shift_y, 水平=shift_x）
+    shift_y = 10  # 上下方向のシフト量（正で下方向、負で上方向）
+    shift_x = 20  # 左右方向のシフト量（正で右方向、負で左方向）
+    img_gray_shifted = np.roll(np.roll(img_gray, shift_y, axis=0), shift_x, axis=1)
+
+    # ここ読み込んでくる
+    f_transform_shift = create_dft(img_gray_shifted)
+
+    # F1, F2 は cv.dft(..., flags=cv.DFT_COMPLEX_OUTPUT) 済みの2ch複素
+    # 1) 相互スペクトル P = F1 * conj(F2)
+    P = cv2.mulSpectrums(f_transform, f_transform_shift, 0, conjB=True)
+    save_pfm(P,'out.pgm_fft_opencv2_P.pfm')
+
+    # 2) 振幅 Pm = |P|
+    eps = 1e-6
+    Pm = cv2.magnitude(P[:, :, 0], P[:, :, 1])
+    Pm = cv2.max(Pm, eps) 
+    save_pfm(Pm,'out.pgm_fft_opencv2_Pm.pfm')
+
+    # 3) クロスパワースペクトル C = P / |P|
+    #    振幅を2chにしてから割る
+    Pm2 = cv2.merge([Pm, Pm])
+    C = cv2.divide(P, Pm2)
+    save_pfm(C,'out.pgm_fft_opencv2_C.pfm')
+
+    # 4) 逆DFTで相関面（ピーク位置を見る）
+    corr = cv2.idft(C, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+
+    # 5) エネルギーを中央にシフト
+    corr_shift = np.fft.fftshift(corr, axes=(0, 1))
+else:
+    # corr_shift = np.fft.fftshift(f_transform, axes=(0, 1))
+    corr_shift = f_transform
+
+save_pfm(f_transform,'out.pgm_fft_opencv2.pfm')
+
+eps = 1e-6
+if corr_shift.ndim == 2:
+    magnitude_spectrum = np.abs(corr_shift)
+else:
+    magnitude_spectrum = cv2.magnitude(corr_shift[:, :, 0], corr_shift[:, :, 1])
+magnitude_spectrum = np.nan_to_num(magnitude_spectrum, nan=0.0, posinf=0.0, neginf=0.0)
+log_magnitude_spectrum = np.log(magnitude_spectrum + eps)
 
 print("FFT and log magnitude spectrum calculated successfully after applying Hanning window.")
 print(f"Shape of magnitude_spectrum: {magnitude_spectrum.shape}, Dtype: {magnitude_spectrum.dtype}")
 print(f"Shape of log_magnitude_spectrum: {log_magnitude_spectrum.shape}, Dtype: {log_magnitude_spectrum.dtype}")
-
-# f_transform は複素数配列なので、実部と虚部を分離して3チャンネルのPFM形式に変換
-# 3チャンネル目はダミーとしてゼロを格納
-complex_fft_output_3ch = np.zeros((f_transform.shape[0], f_transform.shape[1], 3), dtype=np.float32)
-complex_fft_output_3ch[:, :, 0] = f_transform.real.astype(np.float32)
-complex_fft_output_3ch[:, :, 1] = f_transform.imag.astype(np.float32)
-# 3チャンネル目はゼロ（ダミー）
-complex_fft_output_3ch[:, :, 2] = np.zeros_like(f_transform.real, dtype=np.float32)
-
-# 保存パス
-complex_fft_pfm_path = 'out.pgm_fft_opencv.pfm'
-
-# PFMファイルとして保存
-write_pfm(complex_fft_pfm_path, complex_fft_output_3ch)
-
-print(f"Complex FFT result saved as 3-channel PFM to {complex_fft_pfm_path}")

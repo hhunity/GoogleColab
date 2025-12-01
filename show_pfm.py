@@ -46,7 +46,7 @@ def process_pfm_for_magnitude(raw_pfm_data, is_complex_fft_output):
     
     # Apply logarithmic normalization
     log_magnitude_spectrum = np.log(magnitude_spectrum + epsilon)
-
+        
     # Return the log-normalized float array
     return log_magnitude_spectrum
 
@@ -58,7 +58,7 @@ def normalize(img):
         normalized_magnitude_spectrum = ((img - min_log_val) / (max_log_val - min_log_val) * 255).astype(np.uint8)
     else:
         # All pixel values are the same (e.g., all 0 or all constant)
-        normalized_magnitude_spectrum = np.zeros_like(log_magnitude_spectrum, dtype=np.uint8)
+        normalized_magnitude_spectrum = np.zeros_like(img, dtype=np.uint8)
 
     return normalized_magnitude_spectrum
 
@@ -68,19 +68,24 @@ def pfm_open(pfm_path):
 
     return Image.fromarray(log_magnitude_spectrum_normalize, mode='L')
 
-def pfm_open_logmag(pfm_path):
+def pfm_open_logmag(pfm_path,blog=False):
     img_out,color = read_pfm_to_numpy(pfm_path)
-    log_magnitude_spectrum = process_pfm_for_magnitude(img_out,color)
+
+    if blog:
+      log_magnitude_spectrum = process_pfm_for_magnitude(img_out,color)
+    else:
+      log_magnitude_spectrum = img_out
+
     log_magnitude_spectrum_normalize = normalize(log_magnitude_spectrum)
 
     return Image.fromarray(log_magnitude_spectrum_normalize, mode='L')
 
 # 画像ファイルのパス
 imori_path = 'imori.pgm'
-pfm_path1 = 'out.pgm_sobel_cuda.pfm'
-pfm_path2 = 'out.pgm_sobel_opencv.pfm'
-pfm_path3 = 'out.pgm_fft_cuda.pfm'
-pfm_path4 = 'out.pgm_fft_opencv.pfm'
+pfm_path1 = 'out.pgm_fft_opencv.pfm'
+pfm_path2 = 'out.pgm_fft_opencv2_Pm.pfm'
+pfm_path3 = 'out.pgm_fft_opencv2_C.pfm'
+pfm_path4 = 'out.pgm_fft_opencv2.pfm'
 
 try:
     # imori.pgmをオープン
@@ -90,9 +95,9 @@ try:
         img_imori = img_imori.convert('L')
     
     # PFMファイルを読み込み
-    img_out_1 = pfm_open_logmag(pfm_path1)
-    img_out_2 = pfm_open_logmag(pfm_path2)
-    img_out_3 = pfm_open_logmag(pfm_path3)
+    img_out_1 = pfm_open_logmag(pfm_path1,True)
+    img_out_2 = pfm_open_logmag(pfm_path2,True)
+    img_out_3 = pfm_open_logmag(pfm_path3,True)
     img_out_4 = pfm_open_logmag(pfm_path4)
 
     # 2つの画像を並べて表示するために、新しい画像を作成
