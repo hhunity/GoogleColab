@@ -2,6 +2,7 @@ from PIL import Image
 import numpy as np
 import struct
 import re
+import matplotlib.pyplot as plt
 
 def read_pfm_to_numpy(filename):
     with open(filename, 'rb') as file:
@@ -115,7 +116,11 @@ try:
     combined_img.paste(img_out_4, (img_imori.width+img_out_1.width+img_out_2.width+img_out_3.width, 0))
 
     # 結合した画像を表示
-    display(combined_img)
+    # display(combined_img)
+    # combined_img.show()
+    plt.imshow(combined_img, cmap='gray')
+    plt.axis('off')
+    plt.show()
 
     print(f"'{imori_path}' と '{img_out_1}' '{img_out_2}' '{img_out_3}' '{img_out_4}'を並べて表示しました。")
 

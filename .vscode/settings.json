@@ -14,5 +14,7 @@
         "queue": "cpp",
         "stack": "cpp",
         "unordered_map": "cpp"
-    }
+    },
+    "python.defaultInterpreterPath": "venv/bin/python.exe",
+    "python.terminal.activateEnvironment": true
 }

@@ -53,8 +53,8 @@ def process_pfm_for_magnitude(raw_pfm_data, is_complex_fft_output):
 
 # 画像ファイルのパス
 imori_path = 'imori.pgm'
-pfm_path1 = 'out.pgm_fft.pfm'
-pfm_path2 = 'out.pgm_fft_cv.pfm'
+pfm_path1 = 'out.pgm_fft_opencv.pfm'
+pfm_path2 = 'out.pgm_fft_opencv2.pfm'
 
 try:
     # PFMファイルを読み込み、処理してlog_magnitude_spectrumを生成

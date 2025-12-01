@@ -138,6 +138,7 @@ if 1:
 
     # ここ読み込んでくる
     f_transform_shift = create_dft(img_gray_shifted)
+    save_pfm(f_transform_shift,'out.pgm_fft_opencv2_0.pfm')
 
     # F1, F2 は cv.dft(..., flags=cv.DFT_COMPLEX_OUTPUT) 済みの2ch複素
     # 1) 相互スペクトル P = F1 * conj(F2)
@@ -149,7 +150,7 @@ if 1:
     Pm = cv2.magnitude(P[:, :, 0], P[:, :, 1])
     Pm = cv2.max(Pm, eps) 
     save_pfm(Pm,'out.pgm_fft_opencv2_Pm.pfm')
-
+    
     # 3) クロスパワースペクトル C = P / |P|
     #    振幅を2chにしてから割る
     Pm2 = cv2.merge([Pm, Pm])
@@ -165,16 +166,6 @@ else:
     # corr_shift = np.fft.fftshift(f_transform, axes=(0, 1))
     corr_shift = f_transform
 
-save_pfm(f_transform,'out.pgm_fft_opencv2.pfm')
-
-eps = 1e-6
-if corr_shift.ndim == 2:
-    magnitude_spectrum = np.abs(corr_shift)
-else:
-    magnitude_spectrum = cv2.magnitude(corr_shift[:, :, 0], corr_shift[:, :, 1])
-magnitude_spectrum = np.nan_to_num(magnitude_spectrum, nan=0.0, posinf=0.0, neginf=0.0)
-log_magnitude_spectrum = np.log(magnitude_spectrum + eps)
+save_pfm(corr_shift,'out.pgm_fft_opencv2.pfm')
 
 print("FFT and log magnitude spectrum calculated successfully after applying Hanning window.")
-print(f"Shape of magnitude_spectrum: {magnitude_spectrum.shape}, Dtype: {magnitude_spectrum.dtype}")
-print(f"Shape of log_magnitude_spectrum: {log_magnitude_spectrum.shape}, Dtype: {log_magnitude_spectrum.dtype}")

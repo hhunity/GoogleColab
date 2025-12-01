@@ -1,12 +1,22 @@
+import sys
 from PIL import Image
-from google.colab import drive
 
-# Google Driveをマウント
-drive.mount('/content/drive')
+if 'google.colab' in sys.modules:
+    print("Google Colab環境です")
+    bcolab = True
+else:
+    print("Colab環境ではありません")
+    bcolab = False
 
-# imori.jpgのパスを設定（例: MyDriveの直下にある場合）
-# ご自身のファイルのパスに合わせて適宜変更してください
-image_path = '/content/drive/MyDrive/sample/imori.jpg'
+if bcolab:
+    # Google Driveをマウント
+    drive.mount('/content/drive')
+    # imori.jpgのパスを設定（例: MyDriveの直下にある場合）
+    # ご自身のファイルのパスに合わせて適宜変更してください
+    image_path = '/content/drive/MyDrive/sample/imori.jpg'
+else:
+    image_path = 'img/imori.jpg'
+
 output_path = 'imori.pgm'
 
 try:
