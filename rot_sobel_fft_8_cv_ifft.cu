@@ -146,6 +146,39 @@ __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
     }
 }
 
+// 複素乗算: out = a * conj(b)
+__global__ void complex_mul_conj(const cufftComplex* a, const cufftComplex* b,
+                                 cufftComplex* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float ar = a[idx].x, ai = a[idx].y;
+    float br = b[idx].x, bi = -b[idx].y; // conj(b)
+    out[idx].x = ar * br - ai * bi;
+    out[idx].y = ar * bi + ai * br;
+}
+
+// フェーズ相関用に振幅で正規化: out = in / |in| (ゼロ除算回避)
+__global__ void normalize_phase(cufftComplex* inout, int n, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float ar = inout[idx].x;
+    float ai = inout[idx].y;
+    float mag = sqrtf(ar * ar + ai * ai);
+    if (mag < eps) mag = eps;
+    inout[idx].x = ar / mag;
+    inout[idx].y = ai / mag;
+}
+
+// ifft後の実数配列を1/(W*H)でスケールしつつ中心シフトして出力
+__global__ void scale_and_shift(const float* src, float* dst, int width, int height, float scale) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int sx = (x + width / 2) % width;
+    int sy = (y + height / 2) % height;
+    dst[y * width + x] = src[sy * width + sx] * scale;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
@@ -167,38 +200,74 @@ int main(int argc, char** argv) {
     // input img
     Image img;
     if (!read_pgm(in_path, img)) return 1;
-
+    PFMImage pfm_in;
+    std::string pfm_path = "out.pgm_fft_opencv2_0.pfm";
+    if (pfm_path.empty() || !read_pfm(pfm_path, pfm_in)) {
+        std::fprintf(stderr, "Failed to read PFM input (%s)\n", pfm_path.c_str());
+        return 1;
+    }
+    int half_cols_candidate = img.width / 2 + 1;
+    bool width_ok = (pfm_in.width == img.width) || (pfm_in.width == half_cols_candidate);
+    if (!width_ok || pfm_in.height != img.height ||
+        (pfm_in.channels != 1 && pfm_in.channels != 2 && pfm_in.channels != 3)) {
+        std::fprintf(stderr, "PFM input must be W,H=(%d,%d) or W/2+1,H with channels=1/2/3 (real[/imag])\n",
+                     img.width, img.height);
+        return 1;
+    }
+    
     // output fft
     const int fft_w = img.width;
     const int fft_h = img.height;
-    size_t fft_full_elems = static_cast<size_t>(fft_w) * fft_h;
-    std::vector<cufftComplex> fft_host(fft_full_elems);
+    // size_t fft_full_elems = static_cast<size_t>(fft_w) * fft_h;
+    // std::vector<float> fft_host(fft_full_elems);
+    PFMImage corr_pfm;
+    corr_pfm.width = img.width;
+    corr_pfm.height = img.height;
+    corr_pfm.channels = 1;
+    corr_pfm.data.resize(static_cast<size_t>(img.width) * img.height);
 
     // 入力/出力のホストバッファをピン留めしてH2D/D2H転送を高速化
     // ※std::vectorをresizeして再確保させるとポインタが変わり登録が無効になるので、サイズ固定で使い回す。
     CHECK_CUDA(cudaHostRegister(img.data.data(), img.data.size(), cudaHostRegisterDefault));
-    CHECK_CUDA(cudaHostRegister(fft_host.data(), fft_full_elems * sizeof(cufftComplex), cudaHostRegisterDefault));
+    CHECK_CUDA(cudaHostRegister(corr_pfm.data.data(), corr_pfm.data.size() * sizeof(float), cudaHostRegisterDefault));
 
     // define cuda woking memory for rotate & sobel
     unsigned char *d_src = nullptr, *d_dst = nullptr;
     float  *d_mag_f = nullptr, *d_sobel_f = nullptr; 
+    float* d_pfm_f = nullptr;   // FFT2入力用
+    float* d_fft_half = nullptr,*d_fft_full = nullptr;
     CHECK_CUDA(cudaMalloc(&d_src, img.data.size()));
     CHECK_CUDA(cudaMalloc(&d_dst, img.data.size()));
     CHECK_CUDA(cudaMalloc(&d_mag_f  , img.data.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_sobel_f, img.data.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_pfm_f, img.data.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_fft_half, img.data.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_fft_full, img.data.size() * sizeof(float)));
 
     // define FFFT woking memory & cuFFT plane（R2C 半分出力）とフル複素へ展開
+    // cuFFTプランとバッファ（R2C）。出力サイズは height * (width/2 + 1) のcomplex。
     cufftHandle fft_plan;
-    const int half_cols = fft_w / 2 + 1;
-    size_t fft_half_elems = static_cast<size_t>(fft_h) * half_cols;
-    cufftComplex* d_fft_half = nullptr,*d_fft_full = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_fft_half, fft_half_elems * sizeof(cufftComplex)));
-    CHECK_CUDA(cudaMalloc(&d_fft_full, fft_full_elems * sizeof(cufftComplex)));
+    const int fft_out_cols = fft_w / 2 + 1;
+    size_t fft_elems = static_cast<size_t>(fft_h) * fft_out_cols;
+    cufftComplex* d_fft1 = nullptr;
+    cufftComplex* d_fft2 = nullptr;
+    cufftComplex* d_fft_p = nullptr; // multiply結果
+    CHECK_CUDA(cudaMalloc(&d_fft1, fft_elems * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft2, fft_elems * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft_p, fft_elems * sizeof(cufftComplex)));
     if (cufftPlan2d(&fft_plan, fft_h, fft_w, CUFFT_R2C) != CUFFT_SUCCESS) {
         std::fprintf(stderr, "cufftPlan2d failed\n");
         return 1;
     }
+
     cufftSetStream(fft_plan, stream);
+    // 逆FFT用プラン（C2R）
+    cufftHandle ifft_plan;
+    if (cufftPlan2d(&ifft_plan, fft_h, fft_w, CUFFT_C2R) != CUFFT_SUCCESS) {
+        std::fprintf(stderr, "cufftPlan2d (C2R) failed\n");
+        return 1;
+    }
+    cufftSetStream(ifft_plan, stream);
 
     // CUDAイベントでカーネル時間を個別計測（cudaEventRecord: 指定ストリーム上のタイムスタンプを記録）
     cudaEvent_t ev_rot_start, ev_rot_end, ev_sobel_start, ev_sobel_end;
@@ -209,6 +278,35 @@ int main(int argc, char** argv) {
 
     double total_ms = 0.0;
     float total_rot_ms = 0.0f, total_sobel_ms = 0.0f;
+
+    // FFT2（PFM入力）を1回だけ前計算:
+    // OpenCV DFTはフル複素幅=img.widthを出すが、cuFFT R2Cは幅=img.width/2+1にパックされる。
+    // PFMがフル幅なら左半分を切り出し、既に半分幅ならそのまま詰める。
+    {
+        const int pfm_cols = pfm_in.width;
+        const int copy_cols = (pfm_cols == img.width) ? fft_out_cols : pfm_cols;
+        if (copy_cols < fft_out_cols) {
+            std::fprintf(stderr, "PFM width too small: %d (need at least %d)\n", pfm_cols, fft_out_cols);
+            return 1;
+        }
+        std::vector<cufftComplex> fft2_host(fft_elems);
+        for (int y = 0; y < fft_h; ++y) {
+            for (int x = 0; x < fft_out_cols; ++x) {
+                size_t src_idx = static_cast<size_t>(fft_h-y-1) * pfm_cols + x; // 左半分を参照
+                size_t dst_idx = static_cast<size_t>(y) * fft_out_cols + x; // R2C半分
+                float re = 0.0f, im = 0.0f;
+                if (pfm_in.channels == 1) {
+                    re = pfm_in.data[src_idx];
+                } else {
+                    re = pfm_in.data[src_idx * pfm_in.channels + 0];
+                    im = pfm_in.data[src_idx * pfm_in.channels + 1];
+                }
+                fft2_host[dst_idx].x = re;
+                fft2_host[dst_idx].y = im;
+            }
+        }
+        CHECK_CUDA(cudaMemcpy(d_fft2, fft2_host.data(), fft_elems * sizeof(cufftComplex),cudaMemcpyHostToDevice));
+    }
 
     // 初回はコンテキスト起動やJITで遅くなりがち。ループで回すと2回目以降は速くなる（ウォームアップ効果）。
     for (int iter = 0; iter < iters; ++iter) {
@@ -234,18 +332,34 @@ int main(int argc, char** argv) {
         // Sobel結果(u8)をFFT入力用にfloatへ変換し、ハン窓を適用してからFFT（R2C）
         u8_to_float_window<<<grid2, block2, 0, stream>>>(d_mag_f, d_sobel_f, img.width, img.height);
         // FFT実行（R2C 半分出力）
-        if (cufftExecR2C(fft_plan, reinterpret_cast<cufftReal*>(d_sobel_f), d_fft_half) != CUFFT_SUCCESS) {
+        if (cufftExecR2C(fft_plan, reinterpret_cast<cufftReal*>(d_sobel_f), d_fft1) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecR2C failed\n");
             return 1;
         }
         
+        // P = FFT1 * conj(FFT2)
+        int threads = 256;
+        int blocks = (fft_elems + threads - 1) / threads;
+        complex_mul_conj<<<blocks, threads, 0, stream>>>(d_fft1, d_fft2, d_fft_p, static_cast<int>(fft_elems));
+        normalize_phase<<<blocks, threads, 0, stream>>>(d_fft_p, static_cast<int>(fft_elems), 1e-8f);
+        // IFFTで相関ピークを得る
+        if (cufftExecC2R(ifft_plan, d_fft_p, reinterpret_cast<cufftReal*>(d_sobel_f)) != CUFFT_SUCCESS) {
+            std::fprintf(stderr, "cufftExecC2R failed\n");
+            return 1;
+        }
+
+        // スケール＆シフト（DC中心）
+        float inv_scale = 1.0f / (img.width * img.height);
+        scale_and_shift<<<grid2, block2, 0, stream>>>(d_sobel_f, d_pfm_f, img.width, img.height, inv_scale);
+        // 相関出力をPFMに保存（ループ最後にホストへコピー）
+
         // 半分出力をフル複素に展開（OpenCV DFT互換のサイズ）※処理時間に含める
-        dim3 block3(16, 16);
-        dim3 grid3((img.width + block3.x - 1) / block3.x, (img.height + block3.y - 1) / block3.y);
-        unpack_half_to_full<<<grid3, block3, 0, stream>>>(d_fft_half, d_fft_full, img.width, img.height);
+        // dim3 block3(16, 16);
+        // dim3 grid3((img.width + block3.x - 1) / block3.x, (img.height + block3.y - 1) / block3.y);
+        // unpack_half_to_full<<<grid3, block3, 0, stream>>>(d_fft_half, d_fft_full, img.width, img.height);
 
         // 出力転送も非同期。ストリーム上で順序づけされているのでカーネル完了後に転送される。
-        CHECK_CUDA(cudaMemcpyAsync(fft_host.data(), d_fft_full, fft_full_elems * sizeof(cufftComplex), cudaMemcpyDeviceToHost,stream));
+        CHECK_CUDA(cudaMemcpyAsync(corr_pfm.data.data(), d_pfm_f, corr_pfm.data.size()  * sizeof(float), cudaMemcpyDeviceToHost,stream));
         CHECK_CUDA(cudaStreamSynchronize(stream));
 
         float rot_ms = 0.0f, sobel_ms = 0.0f;
@@ -276,27 +390,24 @@ int main(int argc, char** argv) {
     sobel_out.data.resize(static_cast<size_t>(img.width) * img.height);
     CHECK_CUDA(cudaMemcpy(sobel_out.data.data(), d_mag_f, sobel_out.data.size()*sizeof(float),cudaMemcpyDeviceToHost));
     
-    // FFT結果をホストへコピーし、OpenCV DFT互換のフル複素スペクトルをPFM（3ch: R,I,0）で保存（正規化なし）。
-    PFMImage fft_pfm;
-    fft_pfm.width = img.width;
-    fft_pfm.height = img.height;
-    fft_pfm.channels = 3; // R,I,ダミー
-    fft_pfm.data.resize(static_cast<size_t>(img.width) * img.height * 3);
-    for (int y = 0; y < img.height; ++y) {
-        for (int x = 0; x < img.width; ++x) {
-            size_t idx = static_cast<size_t>(y) * img.width + x;
-            fft_pfm.data[idx * 3 + 0] = fft_host[idx].x;
-            fft_pfm.data[idx * 3 + 1] = fft_host[idx].y;
-            fft_pfm.data[idx * 3 + 2] = 0.0f;
-        }
-    }
-    std::string fft_out_path = out_path + "_fft_cuda.pfm";
-    if (!write_pfm(fft_out_path, fft_pfm)) return 1;
-    std::printf("Wrote FFT (complex, OpenCV DFT-like, PFM) to %s\n", fft_out_path.c_str());
+    // std::string fft_out_path = out_path + "_fft_cuda.pfm";
+    // if (!write_pfm(fft_out_path, fft_pfm)) return 1;
+    // std::printf("Wrote FFT (complex, OpenCV DFT-like, PFM) to %s\n", fft_out_path.c_str());
 
     std::string sobel_out_path = out_path + "_sobel_cuda.pfm";
     if (!write_pfm(sobel_out_path, sobel_out)) return 1;
     std::printf("Wrote Sobel magnitude to %s\n", sobel_out_path.c_str());
+
+    // 相関出力（空間ドメイン）をPFMで保存（正規化なし）
+    // PFMImage corr_pfm;
+    // corr_pfm.width = img.width;
+    // corr_pfm.height = img.height;
+    // corr_pfm.channels = 1;
+    // corr_pfm.data.resize(static_cast<size_t>(img.width) * img.height);
+    // CHECK_CUDA(cudaMemcpy(corr_pfm.data.data(), d_pfm_f, corr_pfm.data.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    std::string corr_out_path = out_path + "_pcorr.pfm";
+    if (!write_pfm(corr_out_path, corr_pfm)) return 1;
+    std::printf("Wrote phase correlation (PFM) to %s\n", corr_out_path.c_str());
 
     cudaHostUnregister(img.data.data());
     cudaHostUnregister(sobel_out.data.data());

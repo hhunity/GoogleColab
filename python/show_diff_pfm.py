@@ -65,7 +65,8 @@ try:
     log_mag_spectrum2 = process_pfm_for_magnitude(raw_pfm_data2, is_color2)
 
     # 絶対差を計算
-    abs_diff = np.abs(log_mag_spectrum1 - log_mag_spectrum2)
+    # abs_diff = np.abs(log_mag_spectrum1 - log_mag_spectrum2)
+    abs_diff = np.abs(raw_pfm_data1 - raw_pfm_data2)
 
     # 差を0-255に正規化
     min_diff = abs_diff.min()
