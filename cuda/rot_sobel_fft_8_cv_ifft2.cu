@@ -1,4 +1,44 @@
 %%writefile rot_sobel.cu
+// GPUリソース概算（幅=W, 高さ=H の場合）
+// - デバイスバッファ:
+//   d_src/d_dst: W*H バイト (u8)
+//   d_mag_f/d_sobel_f/d_pfm_f/d_fft_half/d_fft_full: W*H*4 バイト (float)
+//   d_fft1/d_fft2/d_fft_p: H*(W/2+1)*8 バイト (cufftComplex)
+//   d_block_peaks: ceil(W*H/256)*sizeof(Peak)（1要素約8バイト）
+//   d_tmp_peaks: ceil(ceil(W*H/256)/256)*sizeof(Peak)
+//   d_final_peak: 8バイト, d_centroid: 12バイト
+//   （cuFFT内部ワーク領域は cuFFT が管理）
+//   例: 256x256 の場合
+//     u8: 約 2*64 KB
+//     float群: 約 5*256 KB
+//     complex群: 約 3*0.26 MB
+//     peakバッファ: 数KB → 合計でおおよそ 2 MB 弱 + cuFFTワーク
+// - ホスト固定メモリ: 入力 img.data (W*H バイト)
+// - 1イテレーションで起動するカーネル（順番）:
+//   rotate_origin, sobel3x3_mag, u8_to_float_window,
+//   complex_mul_conj, normalize_phase, scale_and_shift,
+//   block_peak, reduce_peak(1), reduce_peak(2), centroid5x5
+//   + cuFFT呼び出し: cufftExecR2C, cufftExecC2R
+//   スレッド・ブロック設定の例:
+//     画像系: block=(16,16), grid=(ceil(W/16), ceil(H/16))
+//     peak系: block_peak/reduce_peak = 256スレッド、grid=ceil((W*H)/256)（2段目はそのさらにceil/256）
+//     centroid5x5 = block=25スレッド, grid=1
+//   ワープ/スレッド/グリッドの考え方:
+//     warpは32スレッド単位。画像系 block=(16,16)=256スレッド→8ワープ/ブロック。block_peak も同様に256スレッド→8ワープ。
+//     gridは「ブロックで画像全体をカバーする数」で、ceil(W/block.x) × ceil(H/block.y)。
+//     peak系のgridはピクセル数を256で割ったもの（2段目はさらに256で割る）、centroid5x5は1ブロックのみ。
+//   GPUごとの並列度（block=256 の理論上限、実際はレジスタ/共有メモリ使用量で減る点に注意）:
+//     T400(推定SM数≈12): 最大 8 block/SM → 約 96 block 同時実行の上限
+//     RTX A2000 12GB(SM=26): 最大 8 block/SM → 約 208 block 同時実行の上限
+//     RTX A4000(SM=48): 最大 8 block/SM → 約 384 block 同時実行の上限
+//     ※1 SMあたりハード上限は 2048 スレッド/SM, 16 block/SM。レジスタや共有メモリの使用量次第でこれより減る。
+// - __syncthreads: ブロック内全スレッドが到達するまで待つバリア。
+//   リダクション中に入れて、他スレッドがまだ共有メモリを更新中の値を読まないようにする。
+// スレッド: 最小の実行単位。
+// ワープ: 32スレッドの束。スケジューラはワープ単位で実行。block=(16,16)=256スレッドなら 8ワープ/ブロック。
+// ブロック: 同期や共有メモリを共有する単位。グリッド内に多数並ぶ。SM（Streaming Multiprocessor）がブロックを順次受け持つ。
+// グリッド: そのカーネル起動で投げられる全ブロック集合。上記では画像系グリッドが 256 ブロック、peak系は 256→1→1 ブロック。
+// SM: GPU のコア群。1SM で複数ブロックを同時に実行（上限はブロック内スレッド数や共有メモリ/レジスタ使用量で決まる）。ワープは SM 内でスケジューリングされる。
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cmath>
@@ -8,6 +48,17 @@
 #include <cufft.h>   // cuFFTを使用してFFTを計算
 #include "pgm_io.h"
 #include "pfm_io.h"  // FFT結果をPFMで保存（OpenCV DFT互換のフル複素）
+
+struct Peak {
+    float val;
+    int idx;
+};
+
+struct Centroid {
+    float m00;
+    float m10;
+    float m01;
+};
 
 #define CHECK_CUDA(call)                                                       \
     do {                                                                       \
@@ -179,6 +230,110 @@ __global__ void scale_and_shift(const float* src, float* dst, int width, int hei
     dst[y * width + x] = src[sy * width + sx] * scale;
 }
 
+// 相関画像からブロックごとの最大値とインデックスを求める。
+// ざっくり流れ:
+//  (1) グローバルメモリ(src)から共有メモリ(s_mem)へ読み込み
+//      └ グローバルは遅いが容量大、共有は速いがブロック内専用キャッシュ的なもの
+//      └ グローバルメモリ: GPU全体で共有される大きなメモリ。帯域は高いがレイテンシが大きい。
+//      └ 共有メモリ: 同じブロックのスレッドでだけ共有できる小さな高速メモリ（SM内キャッシュに近い）。グローバルから読み込んだ値をここに置くことで、そのブロック内のスレッド間で高速に使い回せる。
+//      └ 流れ: src[idx] を各スレッドが s_mem[tid] に書く → __syncthreads() で全員が書き終わるのを待つ → 以降の計算は共有メモリ上のデータを使う。
+//  (2) __syncthreads でブロック内全スレッドのロード完了を待機
+//      └ __syncthreads は「同じブロックの全スレッドがここまで来るまで待つ」バリア
+//  (3) 木構造のリダクションで最大値とその位置を見つける
+//      └ 配列の最大値（や和など）を並列に求める典型手法。要素数を半分ずつ潰していくので「木構造」。
+//      └ 例（block_peak）: 共有メモリに blockDim.x 個の値が入っている状態からスタート。最初はオフセット=blockDim.x/2。
+//      └ tid < offset のスレッドだけが「自分」と「自分+offset」を比較し、大きい方を自分に残す。
+//      └ オフセットを半分にして繰り返す（blockDim.x/2 → blockDim.x/4 → … → 1）。各ステップの前後で __syncthreads() しないと、他スレッドがまだ更新中の値を読んでしまう。
+//      └ 最終的に tid=0 にブロック内の最大値とそのインデックスが残る。
+//      └ 半分ずつ潰す: offset=blockDim/2 から 1 まで、tid<offset が (自分 vs 自分+offset) を比較
+//      └ 各段の前後で __syncthreads を入れ、他スレッドがまだ書き込み中の値を読まないようにする
+//      └ educe_peak も同じパターンで、入力が “ブロック代表の配列” になっているだけ。
+//  __syncthreads とは
+//      └ 同一ブロック内の全スレッドがこの地点に到達するまで待つバリア。これ以前の共有メモリ書き込みが全員完了してから次に進むための安全装置。
+//      └ リダクションの各ステップごとに入れているのは、更新が終わっていないデータを他スレッドが読まないようにするため。
+__global__ void block_peak(const float* src, int n, Peak* block_out) {
+    extern __shared__ float s_mem[];
+    float* s_val = s_mem;
+    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    float v = -1e30f;
+    int id = idx;
+    if (idx < n) {
+        v = src[idx];
+    }
+    s_val[tid] = v; // 共有メモリに値と元インデックスを詰める（速いローカルキャッシュとして使う）
+    s_idx[tid] = id;
+    __syncthreads(); // 全スレッドのロード完了を同期（これ以前のデータ書き込みが全員済むのを待つ）
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) { // 木構造の最大値リダクション（半分ずつ潰す）
+        if (tid < offset) {
+            if (s_val[tid + offset] > s_val[tid]) {
+                s_val[tid] = s_val[tid + offset];
+                s_idx[tid] = s_idx[tid + offset];
+            }
+        }
+        __syncthreads(); // 次段に進む前に全スレッドを揃える（同期しないと別スレッドがまだ更新中かもしれない）
+    }
+    if (tid == 0) {
+        block_out[blockIdx.x].val = s_val[0];
+        block_out[blockIdx.x].idx = s_idx[0];
+    }
+}
+
+// ブロック最大値の配列をさらに縮約して全体の最大値を求める（手順は block_peak と同じ）。
+// ここでも共有メモリに一旦集め、__syncthreads でバリアを挟みつつ木構造リダクションで1要素まで畳む。
+__global__ void reduce_peak(const Peak* src, int n, Peak* out) {
+    extern __shared__ float s_mem[];
+    float* s_val = s_mem;
+    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    float v = -1e30f;
+    int id = 0;
+    if (idx < n) {
+        v = src[idx].val;
+        id = src[idx].idx;
+    }
+    s_val[tid] = v; // 共有メモリに値と元インデックスを詰める
+    s_idx[tid] = id;
+    __syncthreads(); // __syncthreads は同一ブロックの全スレッドが揃うまで待つ
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) { // 木構造の最大値リダクション
+        if (tid < offset) {
+            if (s_val[tid + offset] > s_val[tid]) {
+                s_val[tid] = s_val[tid + offset];
+                s_idx[tid] = s_idx[tid + offset];
+            }
+        }
+        __syncthreads(); // 次段へ進む前に全スレッドを同期
+    }
+    if (tid == 0) {
+        out[blockIdx.x].val = s_val[0];
+        out[blockIdx.x].idx = s_idx[0];
+    }
+}
+
+// 5x5窓で重み付き重心のモーメントを取る（25スレッドだけを使用）
+// 各スレッドが1画素を担当し、atomicAdd で m00/m10/m01 を累積。
+// m00 = 重み総和, m10 = x*重みの総和, m01 = y*重みの総和 → 最後に m10/m00, m01/m00 で重心。
+__global__ void centroid5x5(const float* src, int width, int height, const Peak* peak, Centroid* out) {
+    int tid = threadIdx.x;
+    if (tid >= 25) return;
+    int peak_idx = peak->idx;
+    int px = peak_idx % width;
+    int py = peak_idx / width;
+    int dx = tid % 5 - 2;
+    int dy = tid / 5 - 2;
+    int x = px + dx;
+    int y = py + dy;
+    float v = 0.0f;
+    if (x >= 0 && x < width && y >= 0 && y < height) {
+        v = src[static_cast<size_t>(y) * width + x];
+    }
+    atomicAdd(&out->m00, v);
+    atomicAdd(&out->m10, v * static_cast<float>(x));
+    atomicAdd(&out->m01, v * static_cast<float>(y));
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
@@ -220,22 +375,18 @@ int main(int argc, char** argv) {
     const int fft_h = img.height;
     // size_t fft_full_elems = static_cast<size_t>(fft_w) * fft_h;
     // std::vector<float> fft_host(fft_full_elems);
-    PFMImage corr_pfm;
-    corr_pfm.width = img.width;
-    corr_pfm.height = img.height;
-    corr_pfm.channels = 1;
-    corr_pfm.data.resize(static_cast<size_t>(img.width) * img.height);
-
-    // 入力/出力のホストバッファをピン留めしてH2D/D2H転送を高速化
-    // ※std::vectorをresizeして再確保させるとポインタが変わり登録が無効になるので、サイズ固定で使い回す。
+    // 入力をピン留めしてH2D転送を高速化
     CHECK_CUDA(cudaHostRegister(img.data.data(), img.data.size(), cudaHostRegisterDefault));
-    CHECK_CUDA(cudaHostRegister(corr_pfm.data.data(), corr_pfm.data.size() * sizeof(float), cudaHostRegisterDefault));
 
     // define cuda woking memory for rotate & sobel
     unsigned char *d_src = nullptr, *d_dst = nullptr;
     float  *d_mag_f = nullptr, *d_sobel_f = nullptr; 
     float* d_pfm_f = nullptr;   // FFT2入力用
     float* d_fft_half = nullptr,*d_fft_full = nullptr;
+    Peak* d_block_peaks = nullptr;
+    Peak* d_tmp_peaks = nullptr;
+    Peak* d_final_peak = nullptr;
+    Centroid* d_centroid = nullptr;
     CHECK_CUDA(cudaMalloc(&d_src, img.data.size()));
     CHECK_CUDA(cudaMalloc(&d_dst, img.data.size()));
     CHECK_CUDA(cudaMalloc(&d_mag_f  , img.data.size() * sizeof(float)));
@@ -243,6 +394,15 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_pfm_f, img.data.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_fft_half, img.data.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_fft_full, img.data.size() * sizeof(float)));
+    int total_pixels = img.width * img.height;
+    int peak_threads = 256;
+    int peak_blocks = (total_pixels + peak_threads - 1) / peak_threads;
+    CHECK_CUDA(cudaMalloc(&d_block_peaks, peak_blocks * sizeof(Peak)));
+    int reduce_blocks = (peak_blocks + peak_threads - 1) / peak_threads;
+    if (reduce_blocks < 1) reduce_blocks = 1;
+    CHECK_CUDA(cudaMalloc(&d_tmp_peaks, reduce_blocks * sizeof(Peak)));
+    CHECK_CUDA(cudaMalloc(&d_final_peak, sizeof(Peak)));
+    CHECK_CUDA(cudaMalloc(&d_centroid, sizeof(Centroid)));
 
     // define FFFT woking memory & cuFFT plane（R2C 半分出力）とフル複素へ展開
     // cuFFTプランとバッファ（R2C）。出力サイズは height * (width/2 + 1) のcomplex。
@@ -347,16 +507,30 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cufftExecC2R failed\n");
             return 1;
         }
-        
+
         // スケール＆シフト（DC中心）
         float inv_scale = 1.0f / (img.width * img.height);
         scale_and_shift<<<grid2, block2, 0, stream>>>(d_sobel_f, d_pfm_f, img.width, img.height, inv_scale);
         // 相関出力をPFMに保存（ループ最後にホストへコピー）
+        CHECK_CUDA(cudaGetLastError());
 
-        // 出力転送も非同期。ストリーム上で順序づけされているのでカーネル完了後に転送される。
-        CHECK_CUDA(cudaMemcpyAsync(corr_pfm.data.data(), d_pfm_f, corr_pfm.data.size()  * sizeof(float), cudaMemcpyDeviceToHost,stream));
+        // GPUでピークとサブピクセル重心を計算
+        block_peak<<<peak_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_pfm_f, total_pixels, d_block_peaks);
+        CHECK_CUDA(cudaGetLastError());
+        reduce_peak<<<reduce_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_block_peaks, peak_blocks, d_tmp_peaks);
+        CHECK_CUDA(cudaGetLastError());
+        reduce_peak<<<1, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_tmp_peaks, reduce_blocks, d_final_peak);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaMemsetAsync(d_centroid, 0, sizeof(Centroid), stream));
+        centroid5x5<<<1, 25, 0, stream>>>(d_pfm_f, img.width, img.height, d_final_peak, d_centroid);
+        CHECK_CUDA(cudaGetLastError());
+        
+        // 以降の計測・コピーが走る前にストリーム完了を待つ
         CHECK_CUDA(cudaStreamSynchronize(stream));
-
+        Peak peak_host{};
+        Centroid cent_host{};
+        CHECK_CUDA(cudaMemcpy(&peak_host, d_final_peak, sizeof(Peak), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&cent_host, d_centroid, sizeof(Centroid), cudaMemcpyDeviceToHost));
         float rot_ms = 0.0f, sobel_ms = 0.0f;
         CHECK_CUDA(cudaEventElapsedTime(&rot_ms, ev_rot_start, ev_rot_end));
         CHECK_CUDA(cudaEventElapsedTime(&sobel_ms, ev_sobel_start, ev_sobel_end));
@@ -369,6 +543,22 @@ int main(int argc, char** argv) {
 
         std::printf("[iter %d/%d] 128-157行相当の処理時間: %.3f ms (rotate kernel: %.3f ms, sobel kernel: %.3f ms)\n",
                     iter + 1, iters, elapsed_ms, rot_ms, sobel_ms);
+
+        // ピーク・重心結果をホストに戻して表示
+        double peak_x = peak_host.idx % img.width;
+        double peak_y = peak_host.idx / img.width;
+        double t_x = (cent_host.m00 > 0.0f) ? (cent_host.m10 / cent_host.m00) : peak_x;
+        double t_y = (cent_host.m00 > 0.0f) ? (cent_host.m01 / cent_host.m00) : peak_y;
+    // d_pfm_f は scale_and_shift で 1/(W*H) を掛け済みなので、さらにサイズで割らない
+    double response = peak_host.val;
+        double center_x = static_cast<double>(img.width)  / 2.0;
+        double center_y = static_cast<double>(img.height) / 2.0;
+        double shift_x = t_x - center_x;
+        double shift_y = t_y - center_y;
+        if (shift_x > center_x) shift_x -= img.width;
+        if (shift_y > center_y) shift_y -= img.height;
+        std::printf("phaseCorrelate peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
+                    peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
     }
 
     double avg_ms = total_ms / iters;
@@ -392,20 +582,8 @@ int main(int argc, char** argv) {
     std::string sobel_out_path = out_path + "_sobel_cuda.pfm";
     if (!write_pfm(sobel_out_path, sobel_out)) return 1;
     std::printf("Wrote Sobel magnitude to %s\n", sobel_out_path.c_str());
-
-    // 相関出力（空間ドメイン）をPFMで保存（正規化なし）
-    // PFMImage corr_pfm;
-    // corr_pfm.width = img.width;
-    // corr_pfm.height = img.height;
-    // corr_pfm.channels = 1;
-    // corr_pfm.data.resize(static_cast<size_t>(img.width) * img.height);
-    // CHECK_CUDA(cudaMemcpy(corr_pfm.data.data(), d_pfm_f, corr_pfm.data.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    std::string corr_out_path = out_path + "_pcorr.pfm";
-    if (!write_pfm(corr_out_path, corr_pfm)) return 1;
-    std::printf("Wrote phase correlation (PFM) to %s\n", corr_out_path.c_str());
-
+    
     cudaHostUnregister(img.data.data());
-    cudaHostUnregister(sobel_out.data.data());
     cudaEventDestroy(ev_rot_start);
     cudaEventDestroy(ev_rot_end);
     cudaEventDestroy(ev_sobel_start);
@@ -419,5 +597,9 @@ int main(int argc, char** argv) {
     cudaFree(d_mag_f);
     cudaFree(d_src);
     cudaFree(d_dst);
+    cudaFree(d_block_peaks);
+    cudaFree(d_tmp_peaks);
+    cudaFree(d_final_peak);
+    cudaFree(d_centroid);
     return 0;
 }
