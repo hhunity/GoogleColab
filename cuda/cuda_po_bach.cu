@@ -2,8 +2,8 @@
 // GPUリソース概算（幅=W, 高さ=H の場合）
 // - デバイスバッファ:
 //   d_src/d_dst: W*H バイト (u8)
-//   d_mag_f/d_sobel_f/d_pfm_f/d_fft_half/d_fft_full: W*H*4 バイト (float)
-//   d_fft1/d_fft2/d_fft_p: H*(W/2+1)*8 バイト (cufftComplex)
+//   d_mag_f/d_sobel_f/d_pfm_f: W*H*4 バイト (float) × batch
+//   d_fft1/d_fft2/d_fft_p: H*(W/2+1)*8 バイト (cufftComplex) × batch
 //   d_block_peaks: ceil(W*H/256)*sizeof(Peak)（1要素約8バイト）
 //   d_tmp_peaks: ceil(ceil(W*H/256)/256)*sizeof(Peak)
 //   d_final_peak: 8バイト, d_centroid: 12バイト
@@ -53,7 +53,7 @@
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
-                     "Usage: %s <input.pgm> [output_rot.pgm=rotated.pgm] [angle_deg=30] [iters=1]\n",
+                     "Usage: %s <input.pgm> [output_rot.pgm=rotated.pgm] [angle_deg=30] [iters=1] [split_x=1] [split_y=1]\n",
                      argv[0]);
         return 1;
     }
@@ -63,6 +63,11 @@ int main(int argc, char** argv) {
     float angle_rad = angle_deg * 3.1415926535f / 180.0f;
     int iters = (argc >= 5) ? std::stoi(argv[4]) : 1;
     if (iters < 1) iters = 1;
+    int split_x = (argc >= 6) ? std::stoi(argv[5]) : 1;
+    int split_y = (argc >= 7) ? std::stoi(argv[6]) : 1;
+    if (split_x < 1) split_x = 1;
+    if (split_y < 1) split_y = 1;
+    int batch = split_x * split_y;
     
     // 非同期用ストリーム（cudaStreamCreate: 同一ストリーム内は順序保証。別ストリームを使えば転送と計算を重ねられる）
     cudaStream_t stream;
@@ -77,8 +82,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to read PFM input (%s)\n", pfm_path.c_str());
         return 1;
     }
-    int half_cols_candidate = img.width / 2 + 1;
-    bool width_ok = (pfm_in.width == img.width) || (pfm_in.width == half_cols_candidate);
+    int half_cols_candidate_full = img.width / 2 + 1;
+    bool width_ok = (pfm_in.width == img.width) || (pfm_in.width == half_cols_candidate_full);
     if (!width_ok || pfm_in.height != img.height ||
         (pfm_in.channels != 1 && pfm_in.channels != 2 && pfm_in.channels != 3)) {
         std::fprintf(stderr, "PFM input must be W,H=(%d,%d) or W/2+1,H with channels=1/2/3 (real[/imag])\n",
@@ -86,61 +91,79 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    // output fft
-    const int fft_w = img.width;
-    const int fft_h = img.height;
-    // size_t fft_full_elems = static_cast<size_t>(fft_w) * fft_h;
-    // std::vector<float> fft_host(fft_full_elems);
-    // 入力をピン留めしてH2D転送を高速化
+    // 画像を縦横に分割（コピーなしで各タイルを扱うため、幅・高さが分割数で割り切れる前提）
+    if (img.height % split_y != 0 || img.width % split_x != 0) {
+        std::fprintf(stderr, "image size (%d,%d) not divisible by split (%d,%d)\n", img.width, img.height, split_x, split_y);
+        return 1;
+    }
+    const int tile_w = img.width / split_x;
+    const int tile_h = img.height / split_y;
+    const int tile_pixels = tile_w * tile_h;
+    size_t img_bytes = img.data.size();
+    // 入力をピン留めしてH2D転送を高速化（複製せず1枚のみ）
     CHECK_CUDA(cudaHostRegister(img.data.data(), img.data.size(), cudaHostRegisterDefault));
 
+    // output fft
+    const int fft_w = tile_w;
+    const int fft_h = tile_h;
+    const int total_pixels = tile_pixels;
+    const size_t batch_pixels = static_cast<size_t>(tile_pixels) * batch;
+
     // define cuda woking memory for rotate & sobel
-    unsigned char *d_src = nullptr, *d_dst = nullptr;
+    unsigned char *d_src = nullptr, *d_dst = nullptr; // タイルを連続配置
     float  *d_mag_f = nullptr, *d_sobel_f = nullptr; 
-    float* d_pfm_f = nullptr;   // FFT2入力用
-    float* d_fft_half = nullptr,*d_fft_full = nullptr;
+    float* d_pfm_f = nullptr;   // IFFT出力＋シフト後
     Peak* d_block_peaks = nullptr;
     Peak* d_tmp_peaks = nullptr;
     Peak* d_final_peak = nullptr;
     Centroid* d_centroid = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_src, img.data.size()));
-    CHECK_CUDA(cudaMalloc(&d_dst, img.data.size()));
-    CHECK_CUDA(cudaMalloc(&d_mag_f  , img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_sobel_f, img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_pfm_f, img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_fft_half, img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_fft_full, img.data.size() * sizeof(float)));
-    int total_pixels = img.width * img.height;
+    CHECK_CUDA(cudaMalloc(&d_src, batch_pixels * sizeof(unsigned char))); // u8 なので1バイト/ピクセル
+    CHECK_CUDA(cudaMalloc(&d_dst, batch_pixels * sizeof(unsigned char)));
+    CHECK_CUDA(cudaMalloc(&d_mag_f  , batch_pixels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_sobel_f, batch_pixels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_pfm_f  , batch_pixels * sizeof(float)));
     int peak_threads = 256;
     int peak_blocks = (total_pixels + peak_threads - 1) / peak_threads;
-    CHECK_CUDA(cudaMalloc(&d_block_peaks, peak_blocks * sizeof(Peak)));
+    CHECK_CUDA(cudaMalloc(&d_block_peaks, static_cast<size_t>(peak_blocks) * batch * sizeof(Peak)));
     int reduce_blocks = (peak_blocks + peak_threads - 1) / peak_threads;
     if (reduce_blocks < 1) reduce_blocks = 1;
-    CHECK_CUDA(cudaMalloc(&d_tmp_peaks, reduce_blocks * sizeof(Peak)));
-    CHECK_CUDA(cudaMalloc(&d_final_peak, sizeof(Peak)));
-    CHECK_CUDA(cudaMalloc(&d_centroid, sizeof(Centroid)));
+    CHECK_CUDA(cudaMalloc(&d_tmp_peaks, static_cast<size_t>(reduce_blocks) * batch * sizeof(Peak)));
+    CHECK_CUDA(cudaMalloc(&d_final_peak, batch * sizeof(Peak)));
+    CHECK_CUDA(cudaMalloc(&d_centroid, batch * sizeof(Centroid)));
 
     // define FFFT woking memory & cuFFT plane（R2C 半分出力）とフル複素へ展開
     // cuFFTプランとバッファ（R2C）。出力サイズは height * (width/2 + 1) のcomplex。
     cufftHandle fft_plan;
     const int fft_out_cols = fft_w / 2 + 1;
     size_t fft_elems = static_cast<size_t>(fft_h) * fft_out_cols;
+    size_t batch_fft_elems = fft_elems * batch;
     cufftComplex* d_fft1 = nullptr;
     cufftComplex* d_fft2 = nullptr;
     cufftComplex* d_fft_p = nullptr; // multiply結果
-    CHECK_CUDA(cudaMalloc(&d_fft1, fft_elems * sizeof(cufftComplex)));
-    CHECK_CUDA(cudaMalloc(&d_fft2, fft_elems * sizeof(cufftComplex)));
-    CHECK_CUDA(cudaMalloc(&d_fft_p, fft_elems * sizeof(cufftComplex)));
-    if (cufftPlan2d(&fft_plan, fft_h, fft_w, CUFFT_R2C) != CUFFT_SUCCESS) {
-        std::fprintf(stderr, "cufftPlan2d failed\n");
+    CHECK_CUDA(cudaMalloc(&d_fft1, batch_fft_elems * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft2, batch_fft_elems * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft_p, batch_fft_elems * sizeof(cufftComplex)));
+    int n[2] = {fft_h, fft_w};
+    int inembed[2] = {fft_h, fft_w};
+    int onembed[2] = {fft_h, fft_out_cols};
+    int idist = fft_h * fft_w;
+    int odist = fft_h * fft_out_cols;
+    if (cufftPlanMany(&fft_plan, 2, n,
+                      inembed, 1, idist,
+                      onembed, 1, odist,
+                      CUFFT_R2C, batch) != CUFFT_SUCCESS) {
+        std::fprintf(stderr, "cufftPlanMany (R2C) failed\n");
         return 1;
     }
 
     cufftSetStream(fft_plan, stream);
     // 逆FFT用プラン（C2R）
     cufftHandle ifft_plan;
-    if (cufftPlan2d(&ifft_plan, fft_h, fft_w, CUFFT_C2R) != CUFFT_SUCCESS) {
-        std::fprintf(stderr, "cufftPlan2d (C2R) failed\n");
+    if (cufftPlanMany(&ifft_plan, 2, n,
+                      onembed, 1, odist,
+                      inembed, 1, idist,
+                      CUFFT_C2R, batch) != CUFFT_SUCCESS) {
+        std::fprintf(stderr, "cufftPlanMany (C2R) failed\n");
         return 1;
     }
     cufftSetStream(ifft_plan, stream);
@@ -173,52 +196,87 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "PFM width too small: %d (need at least %d)\n", pfm_cols, fft_out_cols);
             return 1;
         }
-        std::vector<cufftComplex> fft2_host(fft_elems);
-        for (int y = 0; y < fft_h; ++y) {
-            for (int x = 0; x < fft_out_cols; ++x) {
-                size_t src_idx = static_cast<size_t>(fft_h-y-1) * pfm_cols + x; // 左半分を参照
-                size_t dst_idx = static_cast<size_t>(y) * fft_out_cols + x; // R2C半分
-                float re = 0.0f, im = 0.0f;
-                if (pfm_in.channels == 1) {
-                    re = pfm_in.data[src_idx];
-                } else {
-                    re = pfm_in.data[src_idx * pfm_in.channels + 0];
-                    im = pfm_in.data[src_idx * pfm_in.channels + 1];
+        std::vector<cufftComplex> fft2_host(batch_fft_elems);
+        for (int b = 0; b < batch; ++b) {
+            int tile_x = b % split_x;
+            int tile_y = b / split_x;
+            cufftComplex* dst_base = fft2_host.data() + static_cast<size_t>(b) * fft_elems;
+            int start_x = tile_x * tile_w;
+            int start_y = tile_y * tile_h;
+            for (int y = 0; y < fft_h; ++y) {
+                for (int x = 0; x < fft_out_cols; ++x) {
+                    int src_y = (pfm_in.height - 1) - (start_y + y); // 上下反転
+                    int src_x = start_x + x;
+                    if (src_x >= pfm_cols) {
+                        std::fprintf(stderr, "PFM width too small for split (need at least %d columns, have %d)\n",
+                                     start_x + fft_out_cols, pfm_cols);
+                        return 1;
+                    }
+                    size_t src_idx = static_cast<size_t>(src_y) * pfm_cols + src_x;
+                    size_t dst_idx = static_cast<size_t>(y) * fft_out_cols + x; // R2C半分
+                    float re = 0.0f, im = 0.0f;
+                    if (pfm_in.channels == 1) {
+                        re = pfm_in.data[src_idx];
+                    } else {
+                        re = pfm_in.data[src_idx * pfm_in.channels + 0];
+                        im = pfm_in.data[src_idx * pfm_in.channels + 1];
+                    }
+                    dst_base[dst_idx].x = re;
+                    dst_base[dst_idx].y = im;
                 }
-                fft2_host[dst_idx].x = re;
-                fft2_host[dst_idx].y = im;
             }
         }
-        CHECK_CUDA(cudaMemcpy(d_fft2, fft2_host.data(), fft_elems * sizeof(cufftComplex),cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_fft2, fft2_host.data(), batch_fft_elems * sizeof(cufftComplex), cudaMemcpyHostToDevice));
     }
 
     // 初回はコンテキスト起動やJITで遅くなりがち。ループで回すと2回目以降は速くなる（ウォームアップ効果）。
+    std::vector<Peak> peaks_host(batch);
+    std::vector<Centroid> centroids_host(batch);
+    double center_x = static_cast<double>(tile_w)  / 2.0;
+    double center_y = static_cast<double>(tile_h) / 2.0;
     for (int iter = 0; iter < iters; ++iter) {
         auto t_start = std::chrono::steady_clock::now();
 
         // cudaMemcpyAsync: 非同期転送。ここでは同一ストリームで順序づけているので転送完了後にカーネルが走る。
         CHECK_CUDA(cudaEventRecord(ev_rot_start, stream));
 
-        CHECK_CUDA(cudaMemcpyAsync(d_src, img.data.data(), img.data.size(),cudaMemcpyHostToDevice, stream));
+        // H2D: 各タイルを個別にコピー（幅=tile_w, 高さ=tile_h, ピッチ=img.width）
+        for (int b = 0; b < batch; ++b) {
+            int tile_x = b % split_x;
+            int tile_y = b / split_x;
+            const unsigned char* src_ptr = img.data.data() + (tile_y * tile_h * img.width) + tile_x * tile_w;
+            unsigned char* dst_ptr = d_src + static_cast<size_t>(b) * tile_pixels;
+            CHECK_CUDA(cudaMemcpy2DAsync(dst_ptr, tile_w * sizeof(unsigned char),
+                                         src_ptr, img.width * sizeof(unsigned char),
+                                         tile_w * sizeof(unsigned char), tile_h,
+                                         cudaMemcpyHostToDevice, stream));
+        }
 
+        // rotate each batch
         dim3 block(16, 16);
-        dim3 grid((img.width + block.x - 1) / block.x, (img.height + block.y - 1) / block.y);
-        rotate_origin<<<grid, block, 0, stream>>>(d_src, d_dst, img.width, img.height, angle_rad);
+        dim3 grid((tile_w + block.x - 1) / block.x, (tile_h + block.y - 1) / block.y);
+        for (int b = 0; b < batch; ++b) {
+            size_t byte_off = static_cast<size_t>(b) * tile_pixels;
+            rotate_origin<<<grid, block, 0, stream>>>(d_src + byte_off, d_dst + byte_off, tile_w, tile_h, angle_rad);
+        }
         CHECK_CUDA(cudaEventRecord(ev_rot_end, stream));
 
-        // Sobel on the rotated image (d_dst) — 常に実行
+        // Sobel on the rotated image (d_dst) — バッチ分まわす
         dim3 block2(16, 16);
-        dim3 grid2((img.width + block2.x - 1) / block2.x,
-                   (img.height + block2.y - 1) / block2.y);
+        dim3 grid2((tile_w + block2.x - 1) / block2.x,
+                   (tile_h + block2.y - 1) / block2.y);
         CHECK_CUDA(cudaEventRecord(ev_sobel_start, stream));
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_dst, d_mag_f, img.width, img.height);
+        for (int b = 0; b < batch; ++b) {
+            size_t byte_off = static_cast<size_t>(b) * tile_pixels;
+            size_t float_off = static_cast<size_t>(b) * total_pixels;
+            sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_dst + byte_off, d_mag_f + float_off, tile_w, tile_h);
+            u8_to_float_window<<<grid2, block2, 0, stream>>>(d_mag_f + float_off, d_sobel_f + float_off, tile_w, tile_h);
+        }
         CHECK_CUDA(cudaEventRecord(ev_sobel_end, stream));
 
         
         CHECK_CUDA(cudaEventRecord(ev_fft_start, stream));
-        // Sobel結果(u8)をFFT入力用にfloatへ変換し、ハン窓を適用してからFFT（R2C）
-        u8_to_float_window<<<grid2, block2, 0, stream>>>(d_mag_f, d_sobel_f, img.width, img.height);
-        // FFT実行（R2C 半分出力）
+        // FFT実行（R2C 半分出力、PlanManyでバッチ処理）
         if (cufftExecR2C(fft_plan, reinterpret_cast<cufftReal*>(d_sobel_f), d_fft1) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecR2C failed\n");
             return 1;
@@ -227,10 +285,10 @@ int main(int argc, char** argv) {
         
         // P = FFT1 * conj(FFT2)
         int threads = 256;
-        int blocks = (fft_elems + threads - 1) / threads;
+        int blocks = (static_cast<int>(batch_fft_elems) + threads - 1) / threads;
         CHECK_CUDA(cudaEventRecord(ev_ifft_start, stream));
-        complex_mul_conj<<<blocks, threads, 0, stream>>>(d_fft1, d_fft2, d_fft_p, static_cast<int>(fft_elems));
-        normalize_phase<<<blocks, threads, 0, stream>>>(d_fft_p, static_cast<int>(fft_elems), 1e-8f);
+        complex_mul_conj<<<blocks, threads, 0, stream>>>(d_fft1, d_fft2, d_fft_p, static_cast<int>(batch_fft_elems));
+        normalize_phase<<<blocks, threads, 0, stream>>>(d_fft_p, static_cast<int>(batch_fft_elems), 1e-8f);
         // IFFTで相関ピークを得る
         if (cufftExecC2R(ifft_plan, d_fft_p, reinterpret_cast<cufftReal*>(d_sobel_f)) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2R failed\n");
@@ -239,31 +297,39 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaEventRecord(ev_ifft_end, stream));
 
         CHECK_CUDA(cudaEventRecord(ev_peek_start, stream));
-        // スケール＆シフト（DC中心）
-        float inv_scale = 1.0f / (img.width * img.height);
-        scale_and_shift<<<grid2, block2, 0, stream>>>(d_sobel_f, d_pfm_f, img.width, img.height, inv_scale);
-        // 相関出力をPFMに保存（ループ最後にホストへコピー）
+        // スケール＆シフト（DC中心）を各バッチに適用
+        float inv_scale = 1.0f / (tile_w * tile_h);
+        for (int b = 0; b < batch; ++b) {
+            size_t float_off = static_cast<size_t>(b) * total_pixels;
+            scale_and_shift<<<grid2, block2, 0, stream>>>(d_sobel_f + float_off, d_pfm_f + float_off, tile_w, tile_h, inv_scale);
+        }
         CHECK_CUDA(cudaGetLastError());
 
-        // GPUでピークとサブピクセル重心を計算
-        block_peak<<<peak_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_pfm_f, total_pixels, d_block_peaks);
-        CHECK_CUDA(cudaGetLastError());
-        reduce_peak<<<reduce_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_block_peaks, peak_blocks, d_tmp_peaks);
-        CHECK_CUDA(cudaGetLastError());
-        reduce_peak<<<1, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_tmp_peaks, reduce_blocks, d_final_peak);
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA(cudaMemsetAsync(d_centroid, 0, sizeof(Centroid), stream));
-        centroid5x5<<<1, 25, 0, stream>>>(d_pfm_f, img.width, img.height, d_final_peak, d_centroid);
-        CHECK_CUDA(cudaGetLastError());
+        // GPUでピークとサブピクセル重心を計算（バッチごと）
+        size_t shared_bytes = peak_threads * (sizeof(float) + sizeof(int));
+        CHECK_CUDA(cudaMemsetAsync(d_centroid, 0, batch * sizeof(Centroid), stream));
+        for (int b = 0; b < batch; ++b) {
+            size_t float_off = static_cast<size_t>(b) * total_pixels;
+            const float* corr_plane = d_pfm_f + float_off;
+            Peak* block_out = d_block_peaks + static_cast<size_t>(b) * peak_blocks;
+            Peak* tmp_out   = d_tmp_peaks + static_cast<size_t>(b) * reduce_blocks;
+            Peak* final_out = d_final_peak + b;
+            block_peak<<<peak_blocks, peak_threads, shared_bytes, stream>>>(corr_plane, total_pixels, block_out);
+            CHECK_CUDA(cudaGetLastError());
+            reduce_peak<<<reduce_blocks, peak_threads, shared_bytes, stream>>>(block_out, peak_blocks, tmp_out);
+            CHECK_CUDA(cudaGetLastError());
+            reduce_peak<<<1, peak_threads, shared_bytes, stream>>>(tmp_out, reduce_blocks, final_out);
+            CHECK_CUDA(cudaGetLastError());
+            centroid5x5<<<1, 25, 0, stream>>>(corr_plane, tile_w, tile_h, final_out, d_centroid + b);
+            CHECK_CUDA(cudaGetLastError());
+        }
+        CHECK_CUDA(cudaEventRecord(ev_peek_end, stream));
         
         // 以降の計測・コピーが走る前にストリーム完了を待つ
         CHECK_CUDA(cudaStreamSynchronize(stream));
 
-        Peak peak_host{};
-        Centroid cent_host{};
-        CHECK_CUDA(cudaMemcpy(&peak_host, d_final_peak, sizeof(Peak), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaMemcpy(&cent_host, d_centroid, sizeof(Centroid), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaEventRecord(ev_peek_end, stream));
+        CHECK_CUDA(cudaMemcpy(peaks_host.data(), d_final_peak, batch * sizeof(Peak), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(centroids_host.data(), d_centroid, batch * sizeof(Centroid), cudaMemcpyDeviceToHost));
 
         float rot_ms = 0.0f, sobel_ms = 0.0f,peek_ms=0.0f,fft_ms=0.0f,ifft_ms=0.0f;
         CHECK_CUDA(cudaEventElapsedTime(&rot_ms, ev_rot_start, ev_rot_end));
@@ -284,21 +350,31 @@ int main(int argc, char** argv) {
         std::printf("-----------  fft %.3f ms ifft %.3f ms, peek %.3f ms)\n",
                     fft_ms, ifft_ms, peek_ms);
 
-        // ピーク・重心結果をホストに戻して表示
-        double peak_x = peak_host.idx % img.width;
-        double peak_y = peak_host.idx / img.width;
-        double t_x = (cent_host.m00 > 0.0f) ? (cent_host.m10 / cent_host.m00) : peak_x;
-        double t_y = (cent_host.m00 > 0.0f) ? (cent_host.m01 / cent_host.m00) : peak_y;
-        // d_pfm_f は scale_and_shift で 1/(W*H) を掛け済みなので、さらにサイズで割らない
-        double response = peak_host.val;
-        double center_x = static_cast<double>(img.width)  / 2.0;
-        double center_y = static_cast<double>(img.height) / 2.0;
-        double shift_x = t_x - center_x;
-        double shift_y = t_y - center_y;
-        if (shift_x > center_x) shift_x -= img.width;
-        if (shift_y > center_y) shift_y -= img.height;
-        std::printf("phaseCorrelate peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
-                    peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
+        // ピーク・重心結果をホストに戻して表示（バッチ平均も出す）
+        double sum_shift_x = 0.0;
+        double sum_shift_y = 0.0;
+        double sum_response = 0.0;
+        for (int b = 0; b < batch; ++b) {
+            Peak peak_host = peaks_host[b];
+            Centroid cent_host = centroids_host[b];
+            double peak_x = peak_host.idx % tile_w;
+            double peak_y = peak_host.idx / tile_w;
+            double t_x = (cent_host.m00 > 0.0f) ? (cent_host.m10 / cent_host.m00) : peak_x;
+            double t_y = (cent_host.m00 > 0.0f) ? (cent_host.m01 / cent_host.m00) : peak_y;
+            // d_pfm_f は scale_and_shift で 1/(W*H) を掛け済みなので、さらにサイズで割らない
+            double response = peak_host.val;
+            double shift_x = t_x - center_x;
+            double shift_y = t_y - center_y;
+            if (shift_x > center_x) shift_x -= tile_w;
+            if (shift_y > center_y) shift_y -= tile_h;
+            sum_shift_x += shift_x;
+            sum_shift_y += shift_y;
+            sum_response += response;
+            std::printf("batch %d: peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
+                        b, peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
+        }
+        std::printf("batch average shift=(%.4f,%.4f) avg response=%.6f over %d batches\n",
+                    sum_shift_x / batch, sum_shift_y / batch, sum_response / batch, batch);
     }
 
     double avg_ms = total_ms / iters;
@@ -309,11 +385,12 @@ int main(int argc, char** argv) {
 
     //Sobel結果をホストへコピー
     PFMImage sobel_out;
-    sobel_out.width    = img.width;
-    sobel_out.height   = img.height;
+    sobel_out.width    = tile_w;
+    sobel_out.height   = tile_h;
     sobel_out.channels = 1;
-    sobel_out.data.resize(static_cast<size_t>(img.width) * img.height);
-    CHECK_CUDA(cudaMemcpy(sobel_out.data.data(), d_mag_f, sobel_out.data.size()*sizeof(float),cudaMemcpyDeviceToHost));
+    sobel_out.data.resize(static_cast<size_t>(tile_w) * tile_h);
+    // バッチの先頭だけをダンプ
+    CHECK_CUDA(cudaMemcpy(sobel_out.data.data(), d_mag_f, sobel_out.data.size() * sizeof(float), cudaMemcpyDeviceToHost));
     
     // std::string fft_out_path = out_path + "_fft_cuda.pfm";
     // if (!write_pfm(fft_out_path, fft_pfm)) return 1;
@@ -328,13 +405,22 @@ int main(int argc, char** argv) {
     cudaEventDestroy(ev_rot_end);
     cudaEventDestroy(ev_sobel_start);
     cudaEventDestroy(ev_sobel_end);
+    cudaEventDestroy(ev_fft_start);
+    cudaEventDestroy(ev_fft_end);
+    cudaEventDestroy(ev_ifft_start);
+    cudaEventDestroy(ev_ifft_end);
+    cudaEventDestroy(ev_peek_start);
+    cudaEventDestroy(ev_peek_end);
     cudaStreamDestroy(stream);
     cufftDestroy(fft_plan);
+    cufftDestroy(ifft_plan);
 
-    cudaFree(d_fft_full);
-    cudaFree(d_fft_half);
+    cudaFree(d_fft1);
+    cudaFree(d_fft2);
+    cudaFree(d_fft_p);
     cudaFree(d_sobel_f);
     cudaFree(d_mag_f);
+    cudaFree(d_pfm_f);
     cudaFree(d_src);
     cudaFree(d_dst);
     cudaFree(d_block_peaks);
