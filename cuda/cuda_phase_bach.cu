@@ -44,6 +44,26 @@ void save_pfm_real(const std::string& path, const float* src, int width, int hei
     write_pfm(path, out);
 }
 
+// 元画像（全体）からタイルごとにバッチバッファへ詰める
+__global__ void pack_tiles(const float* src, float* dst,
+                           int width, int height,
+                           int tile_w, int tile_h,
+                           int split_x, int split_y) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int b = blockIdx.z;
+    int batch = split_x * split_y;
+    if (b >= batch || x >= tile_w || y >= tile_h) return;
+    int tx = b % split_x;
+    int ty = b / split_x;
+    int src_x = tx * tile_w + x;
+    int src_y = ty * tile_h + y;
+    if (src_x >= width || src_y >= height) return;
+    size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
+    size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
+    dst[dst_idx] = src[src_idx];
+}
+
 int main(int argc, char** argv) {
     // 使い方: ./cuda_phase_bach [split_x=1] [split_y=1]
     int split_x = (argc >= 2) ? std::stoi(argv[1]) : 1;
@@ -73,7 +93,9 @@ int main(int argc, char** argv) {
     const int batch = split_x * split_y;
 
     // デバイスバッファ（タイル全体分）
-    float* d_img1 = nullptr;
+    float* d_img1_full = nullptr;
+    float* d_img2_full = nullptr;
+    float* d_img1 = nullptr; // バッチ連続
     float* d_img2 = nullptr;
     float* d_corr = nullptr;
     Peak* d_block_peaks = nullptr;
@@ -81,6 +103,8 @@ int main(int argc, char** argv) {
     Peak* d_final_peak = nullptr;
     Centroid* d_centroid = nullptr;
     size_t batch_pixels = static_cast<size_t>(tile_pixels) * batch;
+    CHECK_CUDA(cudaMalloc(&d_img1_full, static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_img2_full, static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_img1, batch_pixels * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_img2, batch_pixels * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_corr, batch_pixels * sizeof(float)));
@@ -133,26 +157,17 @@ int main(int argc, char** argv) {
     std::vector<Peak> peaks_host(batch);
     std::vector<Centroid> cent_host(batch);
 
-    // ホスト側で分割した順に並べ替えてからまとめて転送（batch x H x W 連続）
-    // バッチ０→バッチ１→バッチ２と連続に並び替え
-    for (int ty = 0; ty < split_y; ++ty) {
-        for (int tx = 0; tx < split_x; ++tx) {
-            int b = ty * split_x + tx;
-            const float* src1 = img1.data.data() + static_cast<size_t>(ty * tile_h) * img1.width + tx * tile_w;
-            const float* src2 = img2.data.data() + static_cast<size_t>(ty * tile_h) * img2.width + tx * tile_w;
-            float* dst1 = d_img1 + static_cast<size_t>(b) * tile_pixels;
-            float* dst2 = d_img2 + static_cast<size_t>(b) * tile_pixels;
-            // ピッチ付きコピーで元画像のストライドを保ったままタイルを転送
-            CHECK_CUDA(cudaMemcpy2DAsync(dst1, tile_w * sizeof(float),
-                                         src1, img1.width * sizeof(float),
-                                         tile_w * sizeof(float), tile_h,
-                                         cudaMemcpyHostToDevice, stream));
-            CHECK_CUDA(cudaMemcpy2DAsync(dst2, tile_w * sizeof(float),
-                                         src2, img2.width * sizeof(float),
-                                         tile_w * sizeof(float), tile_h,
-                                         cudaMemcpyHostToDevice, stream));
-        }
-    }
+    // 元画像を一括転送し、GPU上でタイル→バッチ配置に詰め替え
+    CHECK_CUDA(cudaMemcpyAsync(d_img1_full, img1.data.data(),
+                               static_cast<size_t>(img1.width) * img1.height * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_img2_full, img2.data.data(),
+                               static_cast<size_t>(img2.width) * img2.height * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    pack_tiles<<<grid3, block, 0, stream>>>(d_img1_full, d_img1, img1.width, img1.height,
+                                            tile_w, tile_h, split_x, split_y);
+    pack_tiles<<<grid3, block, 0, stream>>>(d_img2_full, d_img2, img2.width, img2.height,
+                                            tile_w, tile_h, split_x, split_y);
 
     // 実→複素へ変換
     float_to_complex_batch<<<grid3, block, 0, stream>>>(d_img1, d_fft1, tile_w, tile_h, batch);
@@ -220,6 +235,8 @@ int main(int argc, char** argv) {
     cudaFree(d_fft1);
     cudaFree(d_fft2);
     cudaFree(d_fft_p);
+    cudaFree(d_img1_full);
+    cudaFree(d_img2_full);
     cudaFree(d_img1);
     cudaFree(d_img2);
     cudaFree(d_corr);
