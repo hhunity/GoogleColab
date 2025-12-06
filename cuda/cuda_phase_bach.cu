@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
         double shift_y = center_y - t_y;
         if (shift_x > center_x) shift_x -= tile_w;
         if (shift_y > center_y) shift_y -= tile_h;
-        double response = pk.val / (tile_w * tile_h);
+        double response = ct.m00 / (tile_w * tile_h);
         std::printf("tile %d (%d,%d): peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
                     b, b % split_x, b / split_x,
                     peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
