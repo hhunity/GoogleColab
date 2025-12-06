@@ -27,7 +27,7 @@ try:
     grayscale_img = img.convert('L')
 
     # 256x256ピクセルにリサイズ
-    resized_img = grayscale_img.resize((256, 256))
+    resized_img = grayscale_img.resize((512, 512))
 
     # PGM形式で保存
     resized_img.save(output_path)

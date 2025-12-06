@@ -205,6 +205,33 @@ __global__ void complex_real_scale_shift(const cufftComplex* src, float* dst,
     dst[y * width + x] = src[idx_src].x * scale;
 }
 
+// バッチ版: src=複素、dst=実、batch * (H*W)
+__global__ void complex_real_scale_shift_batch(const cufftComplex* src, float* dst,
+                                               int width, int height, int batch,
+                                               float scale) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int b = blockIdx.z;
+    if (x >= width || y >= height || b >= batch) return;
+    int sx = (x + width / 2) % width;
+    int sy = (y + height / 2) % height;
+    size_t base = static_cast<size_t>(b) * width * height;
+    size_t idx_src = base + static_cast<size_t>(sy) * width + sx;
+    dst[base + static_cast<size_t>(y) * width + x] = src[idx_src].x * scale;
+}
+
+// バッチ版: 実→複素
+__global__ void float_to_complex_batch(const float* src, cufftComplex* dst,
+                                       int width, int height, int batch) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int b = blockIdx.z;
+    if (x >= width || y >= height || b >= batch) return;
+    size_t idx = static_cast<size_t>(b) * width * height + static_cast<size_t>(y) * width + x;
+    dst[idx].x = src[idx];
+    dst[idx].y = 0.0f;
+}
+
 // フル複素配列の振幅を実数1chで出す
 __global__ void complex_to_mag(const cufftComplex* src, float* dst,
                                int width, int height) {
