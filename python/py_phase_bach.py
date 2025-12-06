@@ -33,4 +33,6 @@ for ty in range(split_y):
         tile1 = img1_f32[y0:y0 + tile_h, x0:x0 + tile_w]
         tile2 = img2_f32[y0:y0 + tile_h, x0:x0 + tile_w]
         s, r = cv2.phaseCorrelate(tile1, tile2)
+        cv2.imwrite(f"img_1_{x0}_{y0}.pfm",tile1)
+        cv2.imwrite(f"img_2_{x0}_{y0}.pfm",tile2)
         print(f"tile ({tx},{ty}) shift={s}, response={r}")

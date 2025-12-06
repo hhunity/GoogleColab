@@ -1,5 +1,6 @@
 import sys
 from PIL import Image
+from google.colab import drive
 
 if 'google.colab' in sys.modules:
     print("Google Colab環境です")

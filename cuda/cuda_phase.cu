@@ -9,6 +9,17 @@
 #include "pfm_io.h"  // FFT結果をPFMで保存（OpenCV DFT互換のフル複素）
 #include "cuda_kernels.cuh"
 
+void save_pfm_real(const std::string& path, const float* src, int width, int height) {
+    std::vector<float> host(static_cast<size_t>(width) * height);
+    CHECK_CUDA(cudaMemcpy(host.data(), src, host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    PFMImage out;
+    out.width = width;
+    out.height = height;
+    out.channels = 1;
+    out.data = std::move(host);
+    write_pfm(path, out);
+}
+
 void save_pfm(std::string path,cufftComplex* complex,int width,int height,int c = 3) {
 
     std::vector<cufftComplex> fft_host(width*height);
@@ -42,9 +53,9 @@ int main(int argc, char** argv) {
 
     // input img
     PFMImage img_1;
-    if (!read_pfm("img_1.pfm", img_1)) return 1;
+    if (!read_pfm("img_1_256_256.pfm", img_1)) return 1;
     PFMImage img_2;
-    if (!read_pfm("img_2.pfm", img_2)) return 1;
+    if (!read_pfm("img_2_256_256.pfm", img_2)) return 1;
 
     // output fft
     const int fft_w = img_1.width;
@@ -129,16 +140,24 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    save_pfm("cuda_C.pfm", d_fft_p_full, fft_w, fft_h,1);
+
     // スケール＆シフト（DC中心）、複素→実
+    // opencvのphaseCorrの内部も1/(wxh)されてないものが出るので、スケールは１で良い
     float inv_scale = 1.0f;
     complex_real_scale_shift<<<grid2, block2, 0, stream>>>(d_fft_p_full, d_pfm_f, img_1.width, img_1.height, inv_scale);
     // 相関出力をPFMに保存（ループ最後にホストへコピー）
+
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    save_pfm_real("cuda_C_shift.pfm", d_pfm_f, fft_w, fft_h);
 
     // GPUでピークとサブピクセル重心を計算
     block_peak<<<peak_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_pfm_f, total_pixels, d_block_peaks);
     reduce_peak<<<reduce_blocks, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_block_peaks, peak_blocks, d_tmp_peaks);
     reduce_peak<<<1, peak_threads, peak_threads * (sizeof(float) + sizeof(int)), stream>>>(d_tmp_peaks, reduce_blocks, d_final_peak);
     CHECK_CUDA(cudaMemsetAsync(d_centroid, 0, sizeof(Centroid), stream));
+
     centroid5x5<<<1, 25, 0, stream>>>(d_pfm_f, img_1.width, img_1.height, d_final_peak, d_centroid);
     
     CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -152,7 +171,10 @@ int main(int argc, char** argv) {
     double t_x = (cent_host.m00 > 0.0f) ? (cent_host.m10 / cent_host.m00) : peak_x;
     double t_y = (cent_host.m00 > 0.0f) ? (cent_host.m01 / cent_host.m00) : peak_y;
     // d_pfm_f は scale_and_shift で 1/(W*H) を掛け済みなので、さらにサイズで割らない
-    double response = peak_host.val/(img_1.width * img_1.height);
+
+    // double response = peak_host.val/(img_1.width * img_1.height);
+    // peak_hostは本当のピークのみ。m00が5x5の集合和なのでこれがopencvと一致する
+    double response = cent_host.m00/(img_1.width * img_1.height); 
     double center_x = static_cast<double>(img_1.width)  / 2.0;
     double center_y = static_cast<double>(img_1.height) / 2.0;
     double shift_x = center_x - t_x;
