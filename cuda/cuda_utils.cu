@@ -15,36 +15,32 @@ bool is_cuda_available()
     return deviceCount > 0;
 }
 
-int main()
-{
+int main() {
+    printf("Launching a simple GPU kernel...\n");
+
     if (is_cuda_available()) {
         std::cout << "CUDA is available.\n";
     } else {
         std::cout << "CUDA is NOT available.\n";
+        return;
     }
+
+    const int N = 10;
+    int h_data[N] = {1,2,3,4,5,6,7,8,9,10};
+    int* d_data;
+
+    cudaMalloc(&d_data, N * sizeof(int));
+    cudaMemcpy(d_data, h_data, N*sizeof(int), cudaMemcpyHostToDevice);
+
+    gpu_kernel<<<2, N/2>>>(d_data); //1Block, 5Thradで起動。引数はなし
+    cudaDeviceSynchronize(); // GPUの処理が完了するまで待機
+    cudaMemcpy(h_data, d_data, N*sizeof(int), cudaMemcpyDeviceToHost);
+
+    for(int i=0;i<N;i++) {
+        printf("[%d]=%d",i,h_data[i]);
+    }
+
+    printf("\nGPU kernel finished. Program exiting.\n");
+    return 0;
 }
-
-int count = 0;
-cudaGetDeviceCount(&count);
-
-for (int i = 0; i < count; i++) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, i);
-
-    std::cout << "GPU " << i << ": " << prop.name << "\n";
-    std::cout << "Compute Capability: "
-              << prop.major << "." << prop.minor << "\n";
-}
-
-cudaError_t err = cudaFree(0);  // コンテキスト作成
-if (err != cudaSuccess) ...
-
-void* p = nullptr;
-cudaError_t err = cudaMalloc(&p, 1024);
-cudaFree(p);
-
-int driver, runtime;
-cudaDriverGetVersion(&driver);
-cudaRuntimeGetVersion(&runtime);
-
 
