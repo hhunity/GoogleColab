@@ -131,7 +131,7 @@ __global__ void u8_to_float_window(float* src, float* dst, int width, int height
     float v = static_cast<float>(src[y * width + x]) * wx * wy;
     dst[y * width + x] = v;
 }
-
+#if 0
 // パックされたR2C出力（幅 = width/2+1）を、OpenCV DFT互換のフル複素(width)に左右対称展開する。
 // src: height x (width/2+1) 複素, dst: height x width 複素
 __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
@@ -156,7 +156,7 @@ __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
     v.y = -v.y; // 共役
     dst[idx_dst] = v;
 }
-#if 0
+#else
 // パックされたR2C出力（幅 = width/2+1）を、OpenCV DFT互換のフル複素(width)に左右対称展開する。
 // src: height x (width/2+1) 複素, dst: height x width 複素
 __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
@@ -178,6 +178,7 @@ __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
         v.y = -v.y;
         dst[idx_dst] = v;
     }
+}
 #endif
 
 
