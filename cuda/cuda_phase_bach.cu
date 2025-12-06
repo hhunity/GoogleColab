@@ -168,10 +168,15 @@ int main(int argc, char** argv) {
                                             tile_w, tile_h, split_x, split_y);
     pack_tiles<<<grid3, block, 0, stream>>>(d_img2_full, d_img2, img2.width, img2.height,
                                             tile_w, tile_h, split_x, split_y);
-
+    {
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        save_pfm_real("cuda_batch_in.pfm",d_img1,tile_w,tile_h*split_y*split_x);
+    }
     // 実→複素へ変換
     float_to_complex_batch<<<grid3, block, 0, stream>>>(d_img1, d_fft1, tile_w, tile_h, batch);
     float_to_complex_batch<<<grid3, block, 0, stream>>>(d_img2, d_fft2, tile_w, tile_h, batch);
+
+
 
     // FFT (C2C forward) batched
     if (cufftExecC2C(fft_plan, d_fft1, d_fft1, CUFFT_FORWARD) != CUFFT_SUCCESS ||
@@ -195,7 +200,10 @@ int main(int argc, char** argv) {
     // スケール＆中心シフト（バッチ）
     float inv_scale = 1.0f;
     complex_real_scale_shift_batch<<<grid3, block, 0, stream>>>(d_fft_p, d_corr, tile_w, tile_h, batch, inv_scale);
-
+    {
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        save_pfm_real("cuda_batch_scale_out.pfm",d_corr,tile_w,tile_h*split_y*split_x);
+    }
     // 各タイルのピーク検出
     size_t shared_bytes = peak_threads * (sizeof(float) + sizeof(int));
     for (int b = 0; b < batch; ++b) {

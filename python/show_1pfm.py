@@ -82,48 +82,18 @@ def pfm_open_logmag(pfm_path,blog=False):
     return Image.fromarray(log_magnitude_spectrum_normalize, mode='L')
 
 # 画像ファイルのパス
-imori_path = 'imori.pgm'
-pfm_path1 = 'cuda_batch_in.pfm'
-pfm_path2 = 'cuda_batch_in.pfm'
-pfm_path3 = 'cuda_batch_in.pfm'
-pfm_path4 = 'cuda_batch_in.pfm'
+pfm_path = 'cuda_batch_scale_out.pfm'
 
 try:
-    # imori.pgmをオープン
-    img_imori = Image.open(imori_path)
-    # グレースケール画像であることを確認
-    if img_imori.mode != 'L':
-        img_imori = img_imori.convert('L')
-    
     # PFMファイルを読み込み
-    img_out_1 = pfm_open_logmag(pfm_path1,True)
-    img_out_2 = pfm_open_logmag(pfm_path2,True)
-    img_out_3 = pfm_open_logmag(pfm_path3,True)
-    img_out_4 = pfm_open_logmag(pfm_path4,True)
-
-    # 2つの画像を並べて表示するために、新しい画像を作成
-    total_width = img_imori.width + img_out_1.width + img_out_2.width+ img_out_3.width + img_out_4.width
-    max_height = max(img_imori.height, img_out_1.height,img_out_2.height,img_out_3.height,img_out_4.height)
-
-    # 新しい画像を作成 (モード 'L'はグレースケール)
-    combined_img = Image.new('L', (total_width, max_height), color=255) # 背景を白に設定
-
-    # 各画像を新しい画像に貼り付け
-    combined_img.paste(img_imori, (0, 0))
-    combined_img.paste(img_out_1, (img_imori.width, 0))
-    combined_img.paste(img_out_2, (img_imori.width+img_out_1.width, 0))
-    combined_img.paste(img_out_3, (img_imori.width+img_out_1.width+img_out_2.width, 0))
-    combined_img.paste(img_out_4, (img_imori.width+img_out_1.width+img_out_2.width+img_out_3.width, 0))
+    img_out = pfm_open_logmag(pfm_path)
 
     # 結合した画像を表示
     # display(combined_img)
     # combined_img.show()
-    plt.imshow(combined_img, cmap='gray')
+    plt.imshow(img_out,cmap='gray')
     plt.axis('off')
     plt.show()
-
-    print(f"'{imori_path}' と '{img_out_1}' '{img_out_2}' '{img_out_3}' '{img_out_4}'を並べて表示しました。")
-
 
 except FileNotFoundError as e:
     print(f"エラー: {e.filename} が見つかりませんでした。ファイルが存在するか、パスが正しいか確認してください。")
