@@ -2,8 +2,9 @@
 // GPUリソース概算（幅=W, 高さ=H の場合）
 // - デバイスバッファ:
 //   d_src/d_dst: W*H バイト (u8)
-//   d_mag_f/d_sobel_f/d_pfm_f/d_fft_half/d_fft_full: W*H*4 バイト (float)
+//   d_mag_f/d_sobel_f/d_pfm_f/d_fft_mag/d_fft_mag_shift: W*H*4 バイト (float)
 //   d_fft1/d_fft2/d_fft_p: H*(W/2+1)*8 バイト (cufftComplex)
+//   d_fft1_full/d_fft2_full: W*H*8 バイト (cufftComplex)
 //   d_block_peaks: ceil(W*H/256)*sizeof(Peak)（1要素約8バイト）
 //   d_tmp_peaks: ceil(ceil(W*H/256)/256)*sizeof(Peak)
 //   d_final_peak: 8バイト, d_centroid: 12バイト
@@ -98,7 +99,10 @@ int main(int argc, char** argv) {
     unsigned char *d_src = nullptr, *d_dst = nullptr;
     float  *d_mag_f = nullptr, *d_sobel_f = nullptr; 
     float* d_pfm_f = nullptr;   // FFT2入力用
-    float* d_fft_half = nullptr,*d_fft_full = nullptr;
+    float* d_fft_mag = nullptr; // FFT1フル振幅
+    float* d_fft_mag_shift = nullptr;
+    cufftComplex* d_fft1_full = nullptr;
+    cufftComplex* d_fft2_full = nullptr;
     Peak* d_block_peaks = nullptr;
     Peak* d_tmp_peaks = nullptr;
     Peak* d_final_peak = nullptr;
@@ -108,8 +112,8 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_mag_f  , img.data.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_sobel_f, img.data.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_pfm_f, img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_fft_half, img.data.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_fft_full, img.data.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_fft_mag, img.data.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_fft_mag_shift, img.data.size() * sizeof(float)));
     int total_pixels = img.width * img.height;
     int peak_threads = 256;
     int peak_blocks = (total_pixels + peak_threads - 1) / peak_threads;
@@ -131,6 +135,8 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_fft1, fft_elems * sizeof(cufftComplex)));
     CHECK_CUDA(cudaMalloc(&d_fft2, fft_elems * sizeof(cufftComplex)));
     CHECK_CUDA(cudaMalloc(&d_fft_p, fft_elems * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft1_full, static_cast<size_t>(fft_w) * fft_h * sizeof(cufftComplex)));
+    CHECK_CUDA(cudaMalloc(&d_fft2_full, static_cast<size_t>(fft_w) * fft_h * sizeof(cufftComplex)));
     if (cufftPlan2d(&fft_plan, fft_h, fft_w, CUFFT_R2C) != CUFFT_SUCCESS) {
         std::fprintf(stderr, "cufftPlan2d failed\n");
         return 1;
@@ -173,11 +179,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "PFM width too small: %d (need at least %d)\n", pfm_cols, fft_out_cols);
             return 1;
         }
-        std::vector<cufftComplex> fft2_host(fft_elems);
+        std::vector<cufftComplex> fft2_half(fft_elems);
+        std::vector<cufftComplex> fft2_full(static_cast<size_t>(fft_w) * fft_h);
         for (int y = 0; y < fft_h; ++y) {
+            int src_y = fft_h - y - 1;
             for (int x = 0; x < fft_out_cols; ++x) {
-                size_t src_idx = static_cast<size_t>(fft_h-y-1) * pfm_cols + x; // 左半分を参照
-                size_t dst_idx = static_cast<size_t>(y) * fft_out_cols + x; // R2C半分
+                size_t src_idx = static_cast<size_t>(src_y) * pfm_cols + x; // 左半分を参照
+                size_t dst_half = static_cast<size_t>(y) * fft_out_cols + x; // R2C半分
+                size_t dst_full = static_cast<size_t>(y) * fft_w + x;
                 float re = 0.0f, im = 0.0f;
                 if (pfm_in.channels == 1) {
                     re = pfm_in.data[src_idx];
@@ -185,11 +194,36 @@ int main(int argc, char** argv) {
                     re = pfm_in.data[src_idx * pfm_in.channels + 0];
                     im = pfm_in.data[src_idx * pfm_in.channels + 1];
                 }
-                fft2_host[dst_idx].x = re;
-                fft2_host[dst_idx].y = im;
+                fft2_half[dst_half].x = re;
+                fft2_half[dst_half].y = im;
+                fft2_full[dst_full].x = re;
+                fft2_full[dst_full].y = im;
+            }
+            for (int x = fft_out_cols; x < fft_w; ++x) {
+                cufftComplex v{};
+                if (pfm_cols == fft_w) {
+                    size_t src_idx = static_cast<size_t>(src_y) * pfm_cols + x;
+                    float re = 0.0f, im = 0.0f;
+                    if (pfm_in.channels == 1) {
+                        re = pfm_in.data[src_idx];
+                    } else {
+                        re = pfm_in.data[src_idx * pfm_in.channels + 0];
+                        im = pfm_in.data[src_idx * pfm_in.channels + 1];
+                    }
+                    v.x = re;
+                    v.y = im;
+                } else { // conj-symmetryで右半分を復元
+                    int src_x = fft_w - x;
+                    size_t idx_half = static_cast<size_t>(y) * fft_out_cols + src_x;
+                    v = fft2_half[idx_half];
+                    v.y = -v.y;
+                }
+                size_t dst_full = static_cast<size_t>(y) * fft_w + x;
+                fft2_full[dst_full] = v;
             }
         }
-        CHECK_CUDA(cudaMemcpy(d_fft2, fft2_host.data(), fft_elems * sizeof(cufftComplex),cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_fft2, fft2_half.data(), fft_elems * sizeof(cufftComplex),cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_fft2_full, fft2_full.data(), static_cast<size_t>(fft_w) * fft_h * sizeof(cufftComplex), cudaMemcpyHostToDevice));
     }
 
     // 初回はコンテキスト起動やJITで遅くなりがち。ループで回すと2回目以降は速くなる（ウォームアップ効果）。
@@ -210,6 +244,8 @@ int main(int argc, char** argv) {
         dim3 block2(16, 16);
         dim3 grid2((img.width + block2.x - 1) / block2.x,
                    (img.height + block2.y - 1) / block2.y);
+        dim3 grid_full((fft_w + block2.x - 1) / block2.x,
+                       (fft_h + block2.y - 1) / block2.y);
         CHECK_CUDA(cudaEventRecord(ev_sobel_start, stream));
         sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_dst, d_mag_f, img.width, img.height);
         CHECK_CUDA(cudaEventRecord(ev_sobel_end, stream));
@@ -223,6 +259,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cufftExecR2C failed\n");
             return 1;
         }
+        unpack_half_to_full<<<grid_full, block2, 0, stream>>>(d_fft1, d_fft1_full, fft_w, fft_h);
+        complex_to_mag<<<grid_full, block2, 0, stream>>>(d_fft1_full, d_fft_mag, fft_w, fft_h);
+        scale_and_shift<<<grid_full, block2, 0, stream>>>(d_fft_mag, d_fft_mag_shift, fft_w, fft_h, 1.0f);
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaEventRecord(ev_fft_end, stream));
         
         // P = FFT1 * conj(FFT2)
@@ -237,7 +277,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         CHECK_CUDA(cudaEventRecord(ev_ifft_end, stream));
-
         CHECK_CUDA(cudaEventRecord(ev_peek_start, stream));
         // スケール＆シフト（DC中心）
         float inv_scale = 1.0f / (img.width * img.height);
@@ -322,6 +361,16 @@ int main(int argc, char** argv) {
     std::string sobel_out_path = out_path + "_sobel_cuda.pfm";
     if (!write_pfm(sobel_out_path, sobel_out)) return 1;
     std::printf("Wrote Sobel magnitude to %s\n", sobel_out_path.c_str());
+
+    PFMImage fft1_mag_out;
+    fft1_mag_out.width = img.width;
+    fft1_mag_out.height = img.height;
+    fft1_mag_out.channels = 1;
+    fft1_mag_out.data.resize(static_cast<size_t>(img.width) * img.height);
+    CHECK_CUDA(cudaMemcpy(fft1_mag_out.data.data(), d_fft_mag_shift, fft1_mag_out.data.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    std::string fft1_mag_path = out_path + "_fft1_mag_shift.pfm";
+    if (!write_pfm(fft1_mag_path, fft1_mag_out)) return 1;
+    std::printf("Wrote FFT1 magnitude (full, shifted) to %s\n", fft1_mag_path.c_str());
     
     cudaHostUnregister(img.data.data());
     cudaEventDestroy(ev_rot_start);
@@ -330,9 +379,16 @@ int main(int argc, char** argv) {
     cudaEventDestroy(ev_sobel_end);
     cudaStreamDestroy(stream);
     cufftDestroy(fft_plan);
+    cufftDestroy(ifft_plan);
 
-    cudaFree(d_fft_full);
-    cudaFree(d_fft_half);
+    cudaFree(d_fft1);
+    cudaFree(d_fft2);
+    cudaFree(d_fft_p);
+    cudaFree(d_fft1_full);
+    cudaFree(d_fft2_full);
+    cudaFree(d_fft_mag);
+    cudaFree(d_fft_mag_shift);
+    cudaFree(d_pfm_f);
     cudaFree(d_sobel_f);
     cudaFree(d_mag_f);
     cudaFree(d_src);

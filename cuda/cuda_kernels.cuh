@@ -140,6 +140,31 @@ __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     int half_cols = width / 2 + 1;
     if (x >= width || y >= height) return;
+    size_t idx_dst = static_cast<size_t>(y) * width + x;
+    if (x < half_cols) {
+        // 左半分（元のR2C出力が格納されている範囲）
+        size_t idx_src = static_cast<size_t>(y) * half_cols + x;
+        dst[idx_dst] = src[idx_src];
+        return;
+    }
+    // 右半分は共役対称から復元。2D R2C の対称性は (y,x) ↔ ((H - y) % H, (W - x) % W)
+    int src_x = width - x;
+    int src_y = (y == 0) ? 0 : (height - y);
+    if (src_y == height) src_y = 0; // y=0 の場合
+    size_t idx_src = static_cast<size_t>(src_y) * half_cols + src_x;
+    cufftComplex v = src[idx_src];
+    v.y = -v.y; // 共役
+    dst[idx_dst] = v;
+}
+#if 0
+// パックされたR2C出力（幅 = width/2+1）を、OpenCV DFT互換のフル複素(width)に左右対称展開する。
+// src: height x (width/2+1) 複素, dst: height x width 複素
+__global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
+                                    int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int half_cols = width / 2 + 1;
+    if (x >= width || y >= height) return;
     // 左半分はそのまま
     if (x < half_cols) {
         size_t idx_src = static_cast<size_t>(y) * half_cols + x;
@@ -153,6 +178,42 @@ __global__ void unpack_half_to_full(const cufftComplex* src, cufftComplex* dst,
         v.y = -v.y;
         dst[idx_dst] = v;
     }
+#endif
+
+
+// 実数（float）1chを複素へ: real=src, imag=0
+__global__ void float_to_complex(const float* src, cufftComplex* dst,
+                                 int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    size_t idx = static_cast<size_t>(y) * width + x;
+    dst[idx].x = src[idx];
+    dst[idx].y = 0.0f;
+}
+
+// 複素 -> 実数で中心シフトしつつスケール
+__global__ void complex_real_scale_shift(const cufftComplex* src, float* dst,
+                                         int width, int height, float scale) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int sx = (x + width / 2) % width;
+    int sy = (y + height / 2) % height;
+    size_t idx_src = static_cast<size_t>(sy) * width + sx;
+    dst[y * width + x] = src[idx_src].x * scale;
+}
+
+// フル複素配列の振幅を実数1chで出す
+__global__ void complex_to_mag(const cufftComplex* src, float* dst,
+                               int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    size_t idx = static_cast<size_t>(y) * width + x;
+    float re = src[idx].x;
+    float im = src[idx].y;
+    dst[idx] = sqrtf(re * re + im * im);
 }
 
 // 複素乗算: out = a * conj(b)

@@ -91,6 +91,15 @@ inline bool read_pfm(const std::string& path, PFMImage& img) {
             img.data[i] *= scale_abs;
         }
     }
+    // PFMは下から上に格納される仕様なので、行を反転してトップダウンに戻す
+    size_t row_elems = static_cast<size_t>(img.width) * img.channels;
+    for (int y = 0; y < img.height / 2; ++y) {
+        float* row_top = img.data.data() + static_cast<size_t>(y) * row_elems;
+        float* row_bottom = img.data.data() + static_cast<size_t>(img.height - 1 - y) * row_elems;
+        for (size_t i = 0; i < row_elems; ++i) {
+            std::swap(row_top[i], row_bottom[i]);
+        }
+    }
     return true;
 }
 

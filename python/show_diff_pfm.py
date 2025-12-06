@@ -1,6 +1,7 @@
 from PIL import Image
 import numpy as np
 import struct
+import cv2
 import re
 import matplotlib.pyplot as plt
 
@@ -52,17 +53,20 @@ def process_pfm_for_magnitude(raw_pfm_data, is_complex_fft_output):
     return log_magnitude_spectrum
 
 # 画像ファイルのパス
-imori_path = 'imori.pgm'
-pfm_path1 = 'out.pgm_fft_opencv.pfm'
-pfm_path2 = 'out.pgm_fft_opencv2.pfm'
+pfm_path1 = 'img_1.pfm'
+pfm_path2 = 'cuda_ifft1_full.pfm'
 
 try:
     # PFMファイルを読み込み、処理してlog_magnitude_spectrumを生成
-    raw_pfm_data1, is_color1 = read_pfm_to_numpy(pfm_path1)
-    log_mag_spectrum1 = process_pfm_for_magnitude(raw_pfm_data1, is_color1)
+    # raw_pfm_data1, is_color1 = read_pfm_to_numpy(pfm_path1)
+    raw_pfm_data1 = cv2.imread(pfm_path1, cv2.IMREAD_GRAYSCALE)
+    is_color1 = False
+    # log_mag_spectrum1 = process_pfm_for_magnitude(raw_pfm_data1, is_color1)
 
-    raw_pfm_data2, is_color2 = read_pfm_to_numpy(pfm_path2)
-    log_mag_spectrum2 = process_pfm_for_magnitude(raw_pfm_data2, is_color2)
+    # raw_pfm_data2, is_color1 = read_pfm_to_numpy(pfm_path2)
+    raw_pfm_data2 = cv2.imread(pfm_path2, cv2.IMREAD_GRAYSCALE)
+    is_color2 = False
+    # log_mag_spectrum2 = process_pfm_for_magnitude(raw_pfm_data2, is_color2)
 
     # 絶対差を計算
     # abs_diff = np.abs(log_mag_spectrum1 - log_mag_spectrum2)
@@ -71,6 +75,11 @@ try:
     # 差を0-255に正規化
     min_diff = abs_diff.min()
     max_diff = abs_diff.max()
+    max_index_flat = np.argmax(abs_diff)
+    max_coordinates_3d = np.unravel_index(max_index_flat, abs_diff.shape)
+    max_y = max_coordinates_3d[0]
+    max_x = max_coordinates_3d[1]
+    # max_channel = max_coordinates_3d[2]
 
     if max_diff - min_diff > 0:
         normalized_diff = ((abs_diff - min_diff) / (max_diff - min_diff) * 255).astype(np.uint8)
@@ -79,14 +88,15 @@ try:
 
     # ヒートマップとして表示
     plt.figure(figsize=(8, 6))
-    plt.imshow(normalized_diff, cmap='hot', origin='lower')
+    plt.imshow(normalized_diff, cmap='hot', origin='upper')
     plt.colorbar(label='Absolute Difference (Normalized 0-255)')
     plt.title('Absolute Difference between Log-Normalized FFT Magnitude Spectra')
     plt.axis('off')
     plt.show()
 
     print(f"'Absolute difference heatmap between '{pfm_path1}' and '{pfm_path2}' displayed.")
-    print(f"'min_diff:{min_diff} max_diff:{max_diff}")
+    print(f"'min_diff:{min_diff} max_diff:{max_diff} max_x:{max_x} max_y:{max_y}")
+    print(f"'{pfm_path1}:{log_mag_spectrum1[max_y,max_x]} {pfm_path2}:{log_mag_spectrum2[max_y,max_x]}")
 
 except FileNotFoundError as e:
     print(f"エラー: {e.filename} が見つかりませんでした。ファイルが存在するか、パスが正しいか確認してください。")
