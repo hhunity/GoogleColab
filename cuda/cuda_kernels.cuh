@@ -267,6 +267,23 @@ __global__ void normalize_phase(cufftComplex* inout, int n, float eps) {
     inout[idx].y = ai / mag;
 }
 
+// 相互スペクトル: out = a * conj(b), かつ |out| で正規化（ゼロ除算は eps で回避）
+__global__ void complex_mul_conj_normalize(const cufftComplex* a, const cufftComplex* b,
+                                           cufftComplex* out, int n, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float ar = a[idx].x;
+    float ai = a[idx].y;
+    float br = b[idx].x;
+    float bi = -b[idx].y; // conj(b)
+    float xr = ar * br - ai * bi;
+    float xi = ar * bi + ai * br;
+    float mag = sqrtf(xr * xr + xi * xi);
+    if (mag < eps) mag = eps;
+    out[idx].x = xr / mag;
+    out[idx].y = xi / mag;
+}
+
 // ifft後の実数配列を1/(W*H)でスケールしつつ中心シフトして出力
 __global__ void scale_and_shift(const float* src, float* dst, int width, int height, float scale) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;

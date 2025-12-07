@@ -14,10 +14,13 @@ img_2 = np.roll(np.roll(img_1, shift_y, axis=0), shift_x, axis=1)
 img1_f32 = img_1.astype(np.float32)                     # CV_32FC1 相当
 img2_f32 = img_2.astype(np.float32)                     # CV_32FC1 相当
 
-# pfm.save_pfm(img1_f32,"img_1.pfm")
-# pfm.save_pfm(img2_f32,"img_2.pfm")
 cv2.imwrite("img_1.pfm",img1_f32)
-cv2.imwrite("img_2.pfm",img2_f32)
+cv2.imwrite("img_2.pfm",img2_f32,)
+
+shift,response = cv2.phaseCorrelate(img1_f32,img2_f32)
+
+print("shift:", shift, "response:", response)
+
 
 shift,response = cv2.phaseCorrelate(img1_f32,img2_f32)
 

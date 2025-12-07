@@ -286,7 +286,7 @@ __global__ void final_peak_and_centroid_shifted(const Peak* block_peaks, int blo
 }
 
 //#define USE_FUSED_CORRLESS_PEAK
-//#define USE_TILE_MASK
+
 int main(int argc, char** argv) {
     // 使い方: ./cuda_phase_bach [split_x=1] [split_y=1]
     int split_x = (argc >= 2) ? std::stoi(argv[1]) : 1;
@@ -321,12 +321,11 @@ int main(int argc, char** argv) {
     const int tile_w = img1.width / split_x;
     const int tile_h = img1.height / split_y;
     const int tile_pixels = tile_w * tile_h;
-    std::vector<int> active_tiles;
-    active_tiles.reserve(split_x * split_y);
-
-#ifdef USE_TILE_MASK
     // ここで使用するタイルをマスクで指定（true が処理対象）
     auto use_tile = [](int tx, int ty) {
+        // 例: 2x2 の場合
+        // { {true, false},
+        //   {false, true} }
         static const bool mask[8][3] = {
             {true, true,false,},
             {true, true,false,},
@@ -338,8 +337,12 @@ int main(int argc, char** argv) {
             {true, true,false,}
         };
         if (ty < 3 && tx < 8) return mask[ty][tx];
+        // マスク外はデフォルトで true（必要に応じて変更）
         return false;
     };
+
+    std::vector<int> active_tiles;
+    active_tiles.reserve(split_x * split_y);
     for (int ty = 0; ty < split_y; ++ty) {
         for (int tx = 0; tx < split_x; ++tx) {
             if (use_tile(tx, ty)) {
@@ -347,14 +350,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-#else
-    for (int ty = 0; ty < split_y; ++ty) {
-        for (int tx = 0; tx < split_x; ++tx) {
-            active_tiles.push_back(ty * split_x + tx);
-        }
-    }
-#endif
-
     const int batch = static_cast<int>(active_tiles.size());
     if (batch == 0) {
         std::fprintf(stderr, "No active tiles selected\n");
@@ -389,13 +384,9 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_fft1, batch_pixels * sizeof(cufftComplex)));
     CHECK_CUDA(cudaMalloc(&d_fft2, batch_pixels * sizeof(cufftComplex)));
     CHECK_CUDA(cudaMalloc(&d_fft_p, batch_pixels * sizeof(cufftComplex)));
-#ifdef USE_TILE_MASK
     int* d_active_tiles = nullptr;
     CHECK_CUDA(cudaMalloc(&d_active_tiles, static_cast<size_t>(batch) * sizeof(int)));
     CHECK_CUDA(cudaMemcpy(d_active_tiles, active_tiles.data(), static_cast<size_t>(batch) * sizeof(int), cudaMemcpyHostToDevice));
-#else
-    int* d_active_tiles = nullptr; // 未使用
-#endif
 
     int n[2] = {tile_h, tile_w};
     int inembed[2] = {tile_h, tile_w};
@@ -456,17 +447,10 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpyAsync(d_img2_full, img2.data.data(),
                                 static_cast<size_t>(img2.width) * img2.height * sizeof(float),
                                 cudaMemcpyHostToDevice, stream));
-        // タイル選択に応じたパック
-#ifdef USE_TILE_MASK
         pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full, d_active_tiles, batch,
                                                                   d_fft2,
                                                                   img2.width, img2.height,
                                                                   tile_w, tile_h, split_x, split_y);
-#else
-        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img2_full, d_fft2,
-                                                           img2.width, img2.height,
-                                                           tile_w, tile_h, split_x, split_y);
-#endif
         
         if (cufftExecC2C(fft_plan, d_fft2, d_fft2, CUFFT_FORWARD) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
@@ -485,28 +469,17 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaEventRecord(ev_any_start, stream));
         if (debug) {
             // デバッグ用に実数タイルを保持しておく（PFM出力用）
-#ifdef USE_TILE_MASK
             pack_tiles_masked<<<grid3, block, 0, stream>>>(d_img1_full, d_img1, d_active_tiles, batch,
                                                            img1.width, img1.height,
                                                            tile_w, tile_h, split_x, split_y);
-#else
-            pack_tiles<<<grid3, block, 0, stream>>>(d_img1_full, d_img1, img1.width, img1.height,
-                                                    tile_w, tile_h, split_x, split_y);
-#endif
             CHECK_CUDA(cudaStreamSynchronize(stream));
             save_pfm_real("cuda_batch_in.pfm", d_img1, tile_w, tile_h * batch);
         }
         // 実→複素へ変換を pack と統合
-#ifdef USE_TILE_MASK
         pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img1_full, d_active_tiles, batch,
                                                                   d_fft1,
                                                                   img1.width, img1.height,
                                                                   tile_w, tile_h, split_x, split_y);
-#else
-        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img1_full, d_fft1,
-                                                           img1.width, img1.height,
-                                                           tile_w, tile_h, split_x, split_y);
-#endif
         CHECK_CUDA(cudaEventRecord(ev_any_end, stream));
 
         // FFT (C2C forward) batched
@@ -611,9 +584,7 @@ int main(int argc, char** argv) {
     cudaFree(d_block_peaks);
     cudaFree(d_final_peaks);
     cudaFree(d_centroids);
-#ifdef USE_TILE_MASK
     cudaFree(d_active_tiles);
-#endif
     cudaFreeHost(peaks_host);
     cudaFreeHost(cent_host);
     if (d_cufft_work) cudaFree(d_cufft_work);
