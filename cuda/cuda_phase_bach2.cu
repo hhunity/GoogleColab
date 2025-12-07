@@ -286,7 +286,7 @@ __global__ void final_peak_and_centroid_shifted(const Peak* block_peaks, int blo
 }
 
 //#define USE_FUSED_CORRLESS_PEAK
-
+//#define USE_TILE_MASK
 int main(int argc, char** argv) {
     // 使い方: ./cuda_phase_bach [split_x=1] [split_y=1]
     int split_x = (argc >= 2) ? std::stoi(argv[1]) : 1;
@@ -296,8 +296,11 @@ int main(int argc, char** argv) {
     if (split_x < 1) split_x = 1;
     if (split_y < 1) split_y = 1;
 
-    cudaStream_t stream;
-    CHECK_CUDA(cudaStreamCreate(&stream));
+    cudaStream_t streams[2];
+    cudaStream_t h2d_stream;
+    CHECK_CUDA(cudaStreamCreate(&streams[0]));
+    CHECK_CUDA(cudaStreamCreate(&streams[1]));
+    CHECK_CUDA(cudaStreamCreate(&h2d_stream));
 
     // input img (PFM top-down)
     PFMImage img1, img2;
@@ -321,11 +324,12 @@ int main(int argc, char** argv) {
     const int tile_w = img1.width / split_x;
     const int tile_h = img1.height / split_y;
     const int tile_pixels = tile_w * tile_h;
+    std::vector<int> active_tiles;
+    active_tiles.reserve(split_x * split_y);
+
+#ifdef USE_TILE_MASK
     // ここで使用するタイルをマスクで指定（true が処理対象）
     auto use_tile = [](int tx, int ty) {
-        // 例: 2x2 の場合
-        // { {true, false},
-        //   {false, true} }
         static const bool mask[8][3] = {
             {true, true,false,},
             {true, true,false,},
@@ -337,12 +341,8 @@ int main(int argc, char** argv) {
             {true, true,false,}
         };
         if (ty < 3 && tx < 8) return mask[ty][tx];
-        // マスク外はデフォルトで true（必要に応じて変更）
         return false;
     };
-
-    std::vector<int> active_tiles;
-    active_tiles.reserve(split_x * split_y);
     for (int ty = 0; ty < split_y; ++ty) {
         for (int tx = 0; tx < split_x; ++tx) {
             if (use_tile(tx, ty)) {
@@ -350,6 +350,14 @@ int main(int argc, char** argv) {
             }
         }
     }
+#else
+    for (int ty = 0; ty < split_y; ++ty) {
+        for (int tx = 0; tx < split_x; ++tx) {
+            active_tiles.push_back(ty * split_x + tx);
+        }
+    }
+#endif
+
     const int batch = static_cast<int>(active_tiles.size());
     if (batch == 0) {
         std::fprintf(stderr, "No active tiles selected\n");
@@ -357,36 +365,41 @@ int main(int argc, char** argv) {
     }
 
     // デバイスバッファ（タイル全体分）
-    float* d_img1_full = nullptr;
-    float* d_img2_full = nullptr;
-    float* d_img1 = nullptr; // デバッグ用にバッチ連続の実数タイルを保持
-    float* d_corr = nullptr;
-    Peak* d_block_peaks = nullptr;
-    Peak* d_final_peaks = nullptr;
-    Centroid* d_centroids = nullptr;
-    size_t batch_pixels = static_cast<size_t>(tile_pixels) * batch;
-    CHECK_CUDA(cudaMalloc(&d_img1_full, static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_img2_full, static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_img1, batch_pixels * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_corr, batch_pixels * sizeof(float)));
+    float* d_img1_full[2] = {nullptr, nullptr};
+    float* d_img2_full[2] = {nullptr, nullptr};
+    float* d_img1[2] = {nullptr, nullptr}; // デバッグ用にバッチ連続の実数タイルを保持
+    float* d_corr[2] = {nullptr, nullptr};
+    Peak* d_block_peaks[2] = {nullptr, nullptr};
+    Peak* d_final_peaks[2] = {nullptr, nullptr};
+    Centroid* d_centroids[2] = {nullptr, nullptr};
     int peak_threads = 256;
     int peak_blocks = (tile_pixels + peak_threads - 1) / peak_threads;
-    CHECK_CUDA(cudaMalloc(&d_block_peaks, peak_blocks * sizeof(Peak)));
-    CHECK_CUDA(cudaMalloc(&d_final_peaks, static_cast<size_t>(batch) * sizeof(Peak)));
-    CHECK_CUDA(cudaMalloc(&d_centroids, static_cast<size_t>(batch) * sizeof(Centroid)));
-
+    size_t batch_pixels = static_cast<size_t>(tile_pixels) * batch;
+    for (int b = 0; b < 2; ++b) {
+        CHECK_CUDA(cudaMalloc(&d_img1_full[b], static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_img2_full[b], static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_img1[b], batch_pixels * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_corr[b], batch_pixels * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_block_peaks[b], peak_blocks * sizeof(Peak)));
+        CHECK_CUDA(cudaMalloc(&d_final_peaks[b], static_cast<size_t>(batch) * sizeof(Peak)));
+        CHECK_CUDA(cudaMalloc(&d_centroids[b], static_cast<size_t>(batch) * sizeof(Centroid)));
+    }
     // cuFFT plan (C2C) batched
-    cufftHandle fft_plan, ifft_plan;
+    cufftHandle fft_plan[2], ifft_plan[2];
     // size_t fft_elems_full = static_cast<size_t>(tile_w) * tile_h;
-    cufftComplex* d_fft1 = nullptr;
-    cufftComplex* d_fft2 = nullptr;
-    cufftComplex* d_fft_p = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_fft1, batch_pixels * sizeof(cufftComplex)));
-    CHECK_CUDA(cudaMalloc(&d_fft2, batch_pixels * sizeof(cufftComplex)));
-    CHECK_CUDA(cudaMalloc(&d_fft_p, batch_pixels * sizeof(cufftComplex)));
+    cufftComplex* d_fft1[2] = {nullptr, nullptr};
+    cufftComplex* d_fft2[2] = {nullptr, nullptr};
+    cufftComplex* d_fft_p[2] = {nullptr, nullptr};
+    for (int b = 0; b < 2; ++b) {
+        CHECK_CUDA(cudaMalloc(&d_fft1[b], batch_pixels * sizeof(cufftComplex)));
+        CHECK_CUDA(cudaMalloc(&d_fft2[b], batch_pixels * sizeof(cufftComplex)));
+        CHECK_CUDA(cudaMalloc(&d_fft_p[b], batch_pixels * sizeof(cufftComplex)));
+    }
+#ifdef USE_TILE_MASK
     int* d_active_tiles = nullptr;
     CHECK_CUDA(cudaMalloc(&d_active_tiles, static_cast<size_t>(batch) * sizeof(int)));
     CHECK_CUDA(cudaMemcpy(d_active_tiles, active_tiles.data(), static_cast<size_t>(batch) * sizeof(int), cudaMemcpyHostToDevice));
+#endif
 
     int n[2] = {tile_h, tile_w};
     int inembed[2] = {tile_h, tile_w};
@@ -395,199 +408,224 @@ int main(int argc, char** argv) {
     int idist = tile_w * tile_h;
     int odist = tile_w * tile_h;
 
-    size_t work_size_fwd = 0, work_size_inv = 0;
-    void* d_cufft_work = nullptr;
-    cufftCreate(&fft_plan);
-    cufftCreate(&ifft_plan);
-    cufftSetAutoAllocation(fft_plan, 0);
-    cufftSetAutoAllocation(ifft_plan, 0);
-    if (cufftMakePlanMany(fft_plan, 2, n,
-                          inembed, istride, idist,
-                          onembed, ostride, odist,
-                          CUFFT_C2C, batch, &work_size_fwd) != CUFFT_SUCCESS) {
-        std::fprintf(stderr, "cufftMakePlanMany failed\n");
-        return 1;
-    }
-    if (cufftMakePlanMany(ifft_plan, 2, n,
-                          inembed, istride, idist,
-                          onembed, ostride, odist,
-                          CUFFT_C2C, batch, &work_size_inv) != CUFFT_SUCCESS) {
-        std::fprintf(stderr, "cufftMakePlanMany (C2C inverse) failed\n");
-        return 1;
-    }
-    size_t work_size = std::max(work_size_fwd, work_size_inv);
-    if (work_size > 0) {
-        CHECK_CUDA(cudaMalloc(&d_cufft_work, work_size));
-        cufftSetWorkArea(fft_plan, d_cufft_work);
-        cufftSetWorkArea(ifft_plan, d_cufft_work);
+    void* d_cufft_work[2] = {nullptr, nullptr};
+    for (int b = 0; b < 2; ++b) {
+        size_t work_size_fwd = 0, work_size_inv = 0;
+        cufftCreate(&fft_plan[b]);
+        cufftCreate(&ifft_plan[b]);
+        cufftSetAutoAllocation(fft_plan[b], 0);
+        cufftSetAutoAllocation(ifft_plan[b], 0);
+        if (cufftMakePlanMany(fft_plan[b], 2, n,
+                              inembed, istride, idist,
+                              onembed, ostride, odist,
+                              CUFFT_C2C, batch, &work_size_fwd) != CUFFT_SUCCESS) {
+            std::fprintf(stderr, "cufftMakePlanMany failed\n");
+            return 1;
+        }
+        if (cufftMakePlanMany(ifft_plan[b], 2, n,
+                              inembed, istride, idist,
+                              onembed, ostride, odist,
+                              CUFFT_C2C, batch, &work_size_inv) != CUFFT_SUCCESS) {
+            std::fprintf(stderr, "cufftMakePlanMany (C2C inverse) failed\n");
+            return 1;
+        }
+        size_t work_size = std::max(work_size_fwd, work_size_inv);
+        if (work_size > 0) {
+            CHECK_CUDA(cudaMalloc(&d_cufft_work[b], work_size));
+            cufftSetWorkArea(fft_plan[b], d_cufft_work[b]);
+            cufftSetWorkArea(ifft_plan[b], d_cufft_work[b]);
+        }
+        cufftSetStream(fft_plan[b], streams[b]);
+        cufftSetStream(ifft_plan[b], streams[b]);
     }
 
     dim3 block(16, 16);
     dim3 grid((tile_w + block.x - 1) / block.x, (tile_h + block.y - 1) / block.y);
     dim3 grid3(grid.x, grid.y, batch);
-    Peak* peaks_host = nullptr;
-    Centroid* cent_host = nullptr;
-    CHECK_CUDA(cudaHostAlloc(&peaks_host, static_cast<size_t>(batch) * sizeof(Peak), cudaHostAllocDefault));
-    CHECK_CUDA(cudaHostAlloc(&cent_host, static_cast<size_t>(batch) * sizeof(Centroid), cudaHostAllocDefault));
+    Peak* peaks_host[2] = {nullptr, nullptr};
+    Centroid* cent_host[2] = {nullptr, nullptr};
+    CHECK_CUDA(cudaHostAlloc(&peaks_host[0], static_cast<size_t>(batch) * sizeof(Peak), cudaHostAllocDefault));
+    CHECK_CUDA(cudaHostAlloc(&peaks_host[1], static_cast<size_t>(batch) * sizeof(Peak), cudaHostAllocDefault));
+    CHECK_CUDA(cudaHostAlloc(&cent_host[0], static_cast<size_t>(batch) * sizeof(Centroid), cudaHostAllocDefault));
+    CHECK_CUDA(cudaHostAlloc(&cent_host[1], static_cast<size_t>(batch) * sizeof(Centroid), cudaHostAllocDefault));
 
-    // CUDAイベントでカーネル時間を個別計測（cudaEventRecord: 指定ストリーム上のタイムスタンプを記録）
-    cudaEvent_t ev_fft_start, ev_fft_end, ev_peak_start, ev_peak_end,ev_any_start,ev_any_end;
-    CHECK_CUDA(cudaEventCreate(&ev_fft_start));
-    CHECK_CUDA(cudaEventCreate(&ev_fft_end));
-    CHECK_CUDA(cudaEventCreate(&ev_peak_start));
-    CHECK_CUDA(cudaEventCreate(&ev_peak_end));
-    CHECK_CUDA(cudaEventCreate(&ev_any_start));
-    CHECK_CUDA(cudaEventCreate(&ev_any_end));
+    cudaEvent_t h2d_ready[2];
+    CHECK_CUDA(cudaEventCreate(&h2d_ready[0]));
+    CHECK_CUDA(cudaEventCreate(&h2d_ready[1]));
 
-    cufftSetStream(fft_plan, stream);
-    cufftSetStream(ifft_plan, stream);
+    for (int i = 0; i < 2; i++) {
+        cudaStream_t stream = streams[0];
 
-    for(int i = 0 ; i < iter ; i++) {
-        //FFT2
-        CHECK_CUDA(cudaMemcpyAsync(d_img2_full, img2.data.data(),
-                                static_cast<size_t>(img2.width) * img2.height * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
-        pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full, d_active_tiles, batch,
-                                                                  d_fft2,
+        CHECK_CUDA(cudaMemcpyAsync(d_img2_full[i], img2.data.data(),
+                                   static_cast<size_t>(img2.width) * img2.height * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream));
+#ifdef USE_TILE_MASK
+        pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full[i], d_active_tiles, batch,
+                                                                  d_fft2[i],
                                                                   img2.width, img2.height,
                                                                   tile_w, tile_h, split_x, split_y);
-        
-        if (cufftExecC2C(fft_plan, d_fft2, d_fft2, CUFFT_FORWARD) != CUFFT_SUCCESS) {
+#else
+        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img2_full[i], d_fft2[i],
+                                                           img2.width, img2.height,
+                                                           tile_w, tile_h, split_x, split_y);
+#endif
+        if (cufftExecC2C(fft_plan[i], d_fft2[i], d_fft2[i], CUFFT_FORWARD) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
             return 1;
         }
+        CHECK_CUDA(cudaStreamSynchronize(streams[0]));
+    }
+    
+    auto t_all_start = std::chrono::steady_clock::now();
+    
+    for (int i = 0; i < iter; i++) {
+        int buf = i & 1;
+        cudaStream_t stream = streams[buf];
+        // H2D は専用ストリームで前倒しし、イベントで待つ
+        CHECK_CUDA(cudaMemcpyAsync(d_img1_full[buf], img1.data.data(),
+                                   static_cast<size_t>(img1.width) * img1.height * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream));
+        // //このストリーム上のここまでで、イベントが完了しtら転送完了フラグを立てる
+        // CHECK_CUDA(cudaEventRecord(h2d_ready[buf], h2d_stream));
+        // //転送完了待ち
+        // CHECK_CUDA(cudaStreamWaitEvent(stream, h2d_ready[buf], 0));
 
-        CHECK_CUDA(cudaStreamSynchronize(stream));
-        auto t_start = std::chrono::steady_clock::now();
-
-        // 元画像を一括転送し、GPU上でタイル→バッチ配置に詰め替え
-        CHECK_CUDA(cudaEventRecord(ev_fft_start, stream));
-        CHECK_CUDA(cudaMemcpyAsync(d_img1_full, img1.data.data(),
-                                static_cast<size_t>(img1.width) * img1.height * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
-        
-        CHECK_CUDA(cudaEventRecord(ev_any_start, stream));
-        if (debug) {
-            // デバッグ用に実数タイルを保持しておく（PFM出力用）
-            pack_tiles_masked<<<grid3, block, 0, stream>>>(d_img1_full, d_img1, d_active_tiles, batch,
-                                                           img1.width, img1.height,
-                                                           tile_w, tile_h, split_x, split_y);
-            CHECK_CUDA(cudaStreamSynchronize(stream));
-            save_pfm_real("cuda_batch_in.pfm", d_img1, tile_w, tile_h * batch);
-        }
-        // 実→複素へ変換を pack と統合
-        pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img1_full, d_active_tiles, batch,
-                                                                  d_fft1,
+#ifdef USE_TILE_MASK
+        pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img1_full[buf], d_active_tiles, batch,
+                                                                  d_fft1[buf],
                                                                   img1.width, img1.height,
                                                                   tile_w, tile_h, split_x, split_y);
-        CHECK_CUDA(cudaEventRecord(ev_any_end, stream));
-
-        // FFT (C2C forward) batched
-        if (cufftExecC2C(fft_plan, d_fft1, d_fft1, CUFFT_FORWARD) != CUFFT_SUCCESS) {
+#else
+        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img1_full[buf], d_fft1[buf],
+                                                           img1.width, img1.height,
+                                                           tile_w, tile_h, split_x, split_y);
+#endif
+        if (cufftExecC2C(fft_plan[buf], d_fft1[buf], d_fft1[buf], CUFFT_FORWARD) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
             return 1;
         }
 
-        // 相互スペクトル（バッチ一括）: multiply + normalize を1カーネルに統合
         int threads = 256;
         int blocks = (static_cast<int>(batch_pixels) + threads - 1) / threads;
-        complex_mul_conj_normalize<<<blocks, threads, 0, stream>>>(d_fft1, d_fft2, d_fft_p,
+        complex_mul_conj_normalize<<<blocks, threads, 0, stream>>>(d_fft1[buf], d_fft2[buf], d_fft_p[buf],
                                                                    static_cast<int>(batch_pixels), 1e-16f);
-
-        // IFFT (C2C inverse) batched（バッチ一括）
-        if (cufftExecC2C(ifft_plan, d_fft_p, d_fft_p, CUFFT_INVERSE) != CUFFT_SUCCESS) {
+        if (cufftExecC2C(ifft_plan[buf], d_fft_p[buf], d_fft_p[buf], CUFFT_INVERSE) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C inverse failed\n");
             return 1;
         }
-        CHECK_CUDA(cudaEventRecord(ev_fft_end, stream));
-        CHECK_CUDA(cudaEventRecord(ev_peak_start, stream));
 
-        // スケール＆中心シフト（バッチ）
         float inv_scale = 1.0f;
 #ifdef USE_FUSED_CORRLESS_PEAK
         size_t shared_bytes = peak_threads * (sizeof(float) + sizeof(int));
         for (int b = 0; b < batch; ++b) {
             size_t tile_offset = static_cast<size_t>(b) * tile_pixels;
-            block_peak_shifted<<<peak_blocks, peak_threads, shared_bytes, stream>>>(d_fft_p, tile_w, tile_h,
-                                                                                    tile_offset, d_block_peaks);
-            final_peak_and_centroid_shifted<<<1, peak_threads, shared_bytes, stream>>>(d_block_peaks, peak_blocks,
-                                                                                       d_fft_p, tile_w, tile_h,
+            block_peak_shifted<<<peak_blocks, peak_threads, shared_bytes, stream>>>(d_fft_p[buf], tile_w, tile_h,
+                                                                                    tile_offset, d_block_peaks[buf]);
+            final_peak_and_centroid_shifted<<<1, peak_threads, shared_bytes, stream>>>(d_block_peaks[buf], peak_blocks,
+                                                                                       d_fft_p[buf], tile_w, tile_h,
                                                                                        tile_offset, inv_scale,
-                                                                                       d_final_peaks + b, d_centroids + b);
+                                                                                       d_final_peaks[buf] + b, d_centroids[buf] + b);
         }
 #else
-        //こっちの方が早い
-        complex_real_scale_shift_batch<<<grid3, block, 0, stream>>>(d_fft_p, d_corr, tile_w, tile_h, batch, inv_scale);
-        if(debug){
-            CHECK_CUDA(cudaStreamSynchronize(stream));
-            save_pfm_real("cuda_batch_scale_out.pfm", d_corr, tile_w, tile_h * batch);
-        }
-        // 各タイルのピーク検出
         size_t shared_bytes = peak_threads * (sizeof(float) + sizeof(int));
+        complex_real_scale_shift_batch<<<grid3, block, 0, stream>>>(d_fft_p[buf], d_corr[buf], tile_w, tile_h, batch, inv_scale);
         for (int b = 0; b < batch; ++b) {
-            const float* corr_tile = d_corr + static_cast<size_t>(b) * tile_pixels;
-            block_peak<<<peak_blocks, peak_threads, shared_bytes, stream>>>(corr_tile, tile_pixels, d_block_peaks);
-            final_peak_and_centroid<<<1, peak_threads, shared_bytes, stream>>>(d_block_peaks, peak_blocks,
+            const float* corr_tile = d_corr[buf] + static_cast<size_t>(b) * tile_pixels;
+            block_peak<<<peak_blocks, peak_threads, shared_bytes, stream>>>(corr_tile, tile_pixels, d_block_peaks[buf]);
+            final_peak_and_centroid<<<1, peak_threads, shared_bytes, stream>>>(d_block_peaks[buf], peak_blocks,
                                                                                corr_tile, tile_w, tile_h,
-                                                                               d_final_peaks + b, d_centroids + b);
+                                                                               d_final_peaks[buf] + b, d_centroids[buf] + b);
         }
 #endif
-        CHECK_CUDA(cudaEventRecord(ev_peak_end, stream));
-        CHECK_CUDA(cudaMemcpyAsync(peaks_host, d_final_peaks, static_cast<size_t>(batch) * sizeof(Peak),
-                                   cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA(cudaMemcpyAsync(cent_host, d_centroids, static_cast<size_t>(batch) * sizeof(Centroid),
-                                   cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA(cudaStreamSynchronize(stream));
 
-        auto t_end = std::chrono::steady_clock::now();
-        double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        float fft_ms = 0.0f, peak_ms = 0.0f, any_ms = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&fft_ms, ev_fft_start, ev_fft_end));
-        CHECK_CUDA(cudaEventElapsedTime(&peak_ms, ev_peak_start, ev_peak_end));
-        CHECK_CUDA(cudaEventElapsedTime(&any_ms, ev_any_start, ev_any_end));
-        std::printf("[%d/%d] 処理時間: %.3f ms fft %.3f ms peak %.3f ms any %.3f ms  \n",i,iter,elapsed_ms,fft_ms,peak_ms,any_ms);
-        double center_x = static_cast<double>(tile_w) / 2.0;
-        double center_y = static_cast<double>(tile_h) / 2.0;
-        for (int b = 0; b < batch; ++b) {
-            int tile_idx = active_tiles[b];
-            int tile_tx = tile_idx % split_x;
-            int tile_ty = tile_idx / split_x;
-            Peak pk = peaks_host[b];
-            Centroid ct = cent_host[b];
-            double peak_x = pk.idx % tile_w;
-            double peak_y = pk.idx / tile_w;
-            double t_x = (ct.m00 > 0.0f) ? (ct.m10 / ct.m00) : peak_x;
-            double t_y = (ct.m00 > 0.0f) ? (ct.m01 / ct.m00) : peak_y;
-            double shift_x = center_x - t_x;
-            double shift_y = center_y - t_y;
-            if (shift_x > center_x) shift_x -= tile_w;
-            if (shift_y > center_y) shift_y -= tile_h;
-            double response = ct.m00 / (tile_w * tile_h);
-            if(1){
-                std::printf("tile %d (%d,%d): peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
-                            b, tile_tx, tile_ty,
-                            peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
-                }
+        int prev = buf ^ 1;
+        if (i > 0) {
+            CHECK_CUDA(cudaMemcpyAsync(peaks_host[prev], d_final_peaks[prev], static_cast<size_t>(batch) * sizeof(Peak),
+                                   cudaMemcpyDeviceToHost, stream));
+            CHECK_CUDA(cudaMemcpyAsync(cent_host[prev], d_centroids[prev], static_cast<size_t>(batch) * sizeof(Centroid),
+                                   cudaMemcpyDeviceToHost, stream));
+            CHECK_CUDA(cudaStreamSynchronize(streams[prev]));
+
+            double center_x = static_cast<double>(tile_w) / 2.0;
+            double center_y = static_cast<double>(tile_h) / 2.0;
+            // for (int b = 0; b < batch; ++b) {
+            //     int tile_idx = active_tiles[b];
+            //     int tile_tx = tile_idx % split_x;
+            //     int tile_ty = tile_idx / split_x;
+            //     Peak pk = peaks_host[prev][b];
+            //     Centroid ct = cent_host[prev][b];
+            //     double peak_x = pk.idx % tile_w;
+            //     double peak_y = pk.idx / tile_w;
+            //     double t_x = (ct.m00 > 0.0f) ? (ct.m10 / ct.m00) : peak_x;
+            //     double t_y = (ct.m00 > 0.0f) ? (ct.m01 / ct.m00) : peak_y;
+            //     double shift_x = center_x - t_x;
+            //     double shift_y = center_y - t_y;
+            //     if (shift_x > center_x) shift_x -= tile_w;
+            //     if (shift_y > center_y) shift_y -= tile_h;
+            //     double response = ct.m00 / (tile_w * tile_h);
+            //     std::printf("tile %d (%d,%d): peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
+            //                 b, tile_tx, tile_ty,
+            //                 peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
+            // }
         }
     }
+    
+    auto t_all_end = std::chrono::steady_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(t_all_end - t_all_start).count();
+    std::printf("Total %.3f ms, avg %.3f ms/frame over %d iterations\n", total_ms, total_ms / iter, iter);
 
-    cudaStreamDestroy(stream);
-    cufftDestroy(fft_plan);
-    cufftDestroy(ifft_plan);
-    cudaFree(d_fft1);
-    cudaFree(d_fft2);
-    cudaFree(d_fft_p);
-    cudaFree(d_img1_full);
-    cudaFree(d_img2_full);
-    cudaFree(d_img1);
-    cudaFree(d_corr);
-    cudaFree(d_block_peaks);
-    cudaFree(d_final_peaks);
-    cudaFree(d_centroids);
+    int last = (iter - 1) & 1;
+    CHECK_CUDA(cudaStreamSynchronize(streams[last]));
+    double center_x = static_cast<double>(tile_w) / 2.0;
+    double center_y = static_cast<double>(tile_h) / 2.0;
+    for (int b = 0; b < batch; ++b) {
+        int tile_idx = active_tiles[b];
+        int tile_tx = tile_idx % split_x;
+        int tile_ty = tile_idx / split_x;
+        Peak pk = peaks_host[last][b];
+        Centroid ct = cent_host[last][b];
+        double peak_x = pk.idx % tile_w;
+        double peak_y = pk.idx / tile_w;
+        double t_x = (ct.m00 > 0.0f) ? (ct.m10 / ct.m00) : peak_x;
+        double t_y = (ct.m00 > 0.0f) ? (ct.m01 / ct.m00) : peak_y;
+        double shift_x = center_x - t_x;
+        double shift_y = center_y - t_y;
+        if (shift_x > center_x) shift_x -= tile_w;
+        if (shift_y > center_y) shift_y -= tile_h;
+        double response = ct.m00 / (tile_w * tile_h);
+        std::printf("tile %d (%d,%d): peak=(%.0f,%.0f) subpix=(%.4f,%.4f) shift=(%.4f,%.4f) response=%.6f\n",
+                    b, tile_tx, tile_ty,
+                    peak_x, peak_y, t_x, t_y, shift_x, shift_y, response);
+    }
+
+    cudaStreamDestroy(streams[0]);
+    cudaStreamDestroy(streams[1]);
+    cudaStreamDestroy(h2d_stream);
+    cudaEventDestroy(h2d_ready[0]);
+    cudaEventDestroy(h2d_ready[1]);
+    for (int b = 0; b < 2; ++b) {
+        cufftDestroy(fft_plan[b]);
+        cufftDestroy(ifft_plan[b]);
+        cudaFree(d_fft1[b]);
+        cudaFree(d_fft2[b]);
+        cudaFree(d_fft_p[b]);
+        cudaFree(d_img1_full[b]);
+        cudaFree(d_img2_full[b]);
+        cudaFree(d_img1[b]);
+        cudaFree(d_corr[b]);
+        cudaFree(d_block_peaks[b]);
+        cudaFree(d_final_peaks[b]);
+        cudaFree(d_centroids[b]);
+    }
+#ifdef USE_TILE_MASK
     cudaFree(d_active_tiles);
-    cudaFreeHost(peaks_host);
-    cudaFreeHost(cent_host);
-    if (d_cufft_work) cudaFree(d_cufft_work);
+#endif
+    cudaFreeHost(peaks_host[0]);
+    cudaFreeHost(peaks_host[1]);
+    cudaFreeHost(cent_host[0]);
+    cudaFreeHost(cent_host[1]);
+    if (d_cufft_work[0]) cudaFree(d_cufft_work[0]);
+    if (d_cufft_work[1]) cudaFree(d_cufft_work[1]);
     CHECK_CUDA(cudaHostUnregister(img1.data.data()));
     CHECK_CUDA(cudaHostUnregister(img2.data.data()));
     return 0;

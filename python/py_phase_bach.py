@@ -14,8 +14,8 @@ img_2 = np.roll(np.roll(img_1, shift_y, axis=0), shift_x, axis=1)
 
 img1_f32 = img_1.astype(np.float32)
 img2_f32 = img_2.astype(np.float32)
-cv2.imwrite("img_1.pfm",img1_f32)
-cv2.imwrite("img_2.pfm",img2_f32)
+cv2.imwrite(f"img_1_{}_{img_1}.pfm",img1_f32)
+cv2.imwrite(f"img_2_{}_{}.pfm",img2_f32)
 
 # 全体の位相相関
 shift, response = cv2.phaseCorrelate(img1_f32, img2_f32)

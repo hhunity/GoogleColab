@@ -379,7 +379,6 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_block_peaks, peak_blocks * sizeof(Peak)));
     CHECK_CUDA(cudaMalloc(&d_final_peaks, static_cast<size_t>(batch) * sizeof(Peak)));
     CHECK_CUDA(cudaMalloc(&d_centroids, static_cast<size_t>(batch) * sizeof(Centroid)));
-
     // cuFFT plan (C2C) batched
     cufftHandle fft_plan, ifft_plan;
     // size_t fft_elems_full = static_cast<size_t>(tile_w) * tile_h;
@@ -393,8 +392,6 @@ int main(int argc, char** argv) {
     int* d_active_tiles = nullptr;
     CHECK_CUDA(cudaMalloc(&d_active_tiles, static_cast<size_t>(batch) * sizeof(int)));
     CHECK_CUDA(cudaMemcpy(d_active_tiles, active_tiles.data(), static_cast<size_t>(batch) * sizeof(int), cudaMemcpyHostToDevice));
-#else
-    int* d_active_tiles = nullptr; // 未使用
 #endif
 
     int n[2] = {tile_h, tile_w};
@@ -436,8 +433,10 @@ int main(int argc, char** argv) {
     dim3 grid3(grid.x, grid.y, batch);
     Peak* peaks_host = nullptr;
     Centroid* cent_host = nullptr;
+    float* host_d_corr = nullptr;
     CHECK_CUDA(cudaHostAlloc(&peaks_host, static_cast<size_t>(batch) * sizeof(Peak), cudaHostAllocDefault));
     CHECK_CUDA(cudaHostAlloc(&cent_host, static_cast<size_t>(batch) * sizeof(Centroid), cudaHostAllocDefault));
+    CHECK_CUDA(cudaHostAlloc(&host_d_corr, static_cast<size_t>(tile_w*tile_h*batch) * sizeof(float), cudaHostAllocDefault));
 
     // CUDAイベントでカーネル時間を個別計測（cudaEventRecord: 指定ストリーム上のタイムスタンプを記録）
     cudaEvent_t ev_fft_start, ev_fft_end, ev_peak_start, ev_peak_end,ev_any_start,ev_any_end;
@@ -528,7 +527,7 @@ int main(int argc, char** argv) {
         }
         CHECK_CUDA(cudaEventRecord(ev_fft_end, stream));
         CHECK_CUDA(cudaEventRecord(ev_peak_start, stream));
-
+        
         // スケール＆中心シフト（バッチ）
         float inv_scale = 1.0f;
 #ifdef USE_FUSED_CORRLESS_PEAK
@@ -545,8 +544,13 @@ int main(int argc, char** argv) {
 #else
         //こっちの方が早い
         complex_real_scale_shift_batch<<<grid3, block, 0, stream>>>(d_fft_p, d_corr, tile_w, tile_h, batch, inv_scale);
-        if(debug){
+        if(1){
             CHECK_CUDA(cudaStreamSynchronize(stream));
+            CHECK_CUDA(cudaMemcpyAsync(host_d_corr,d_corr,static_cast<size_t>(tile_w*tile_h*batch) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+            auto t_end = std::chrono::steady_clock::now();
+            double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            std::printf("[%d/%d] before ifft: %.3f ms\n",i,iter,elapsed_ms);
             save_pfm_real("cuda_batch_scale_out.pfm", d_corr, tile_w, tile_h * batch);
         }
         // 各タイルのピーク検出

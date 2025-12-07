@@ -1,8 +1,9 @@
 import sys
 from PIL import Image
-from google.colab import drive
+import cv2
 
 if 'google.colab' in sys.modules:
+    from google.colab import drive
     print("Google Colab環境です")
     bcolab = True
 else:
@@ -28,10 +29,15 @@ try:
     grayscale_img = img.convert('L')
 
     # 256x256ピクセルにリサイズ
-    resized_img = grayscale_img.resize((512, 512))
+    w = 2048
+    h = 2048
+    resized_img = grayscale_img.resize((w, h))
 
     # PGM形式で保存
-    resized_img.save(output_path)
+    filename = f'imori_{w}_{h}'
+    resized_img.save(filename+'.pgm')
+    img = cv2.imread(filename+'.pgm')
+    cv2.imwrite(filename+'.pfm',img)
 
     print(f"'{image_path}' をグレースケールに変換し、256x256ピクセルにリサイズ後、'{output_path}' として保存しました。")
 

@@ -55,9 +55,9 @@ int main(int argc, char** argv) {
 
     // input img
     PFMImage img_1;
-    if (!read_pfm("img_1_256_256.pfm", img_1)) return 1;
+    if (!read_pfm("img_1.pfm", img_1)) return 1;
     PFMImage img_2;
-    if (!read_pfm("img_2_256_256.pfm", img_2)) return 1;
+    if (!read_pfm("img_2.pfm", img_2)) return 1;
 
     // output fft
     const int fft_w = img_1.width;
