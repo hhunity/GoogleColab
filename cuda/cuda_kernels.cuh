@@ -115,6 +115,24 @@ __global__ void sobel3x3_mag(const unsigned char* src, float* mag_out,
 }
 
 // u8 -> float 変換（R2C入力用）＋2Dハン窓を適用してリークを低減
+__global__ void float_hann_window(float* src, float* dst, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float pi = 3.1415926535f;
+    float wx = 1.0f;
+    float wy = 1.0f;
+    if (width > 1) {
+        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (width - 1)));
+    }
+    if (height > 1) {
+        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (height - 1)));
+    }
+    float v = static_cast<float>(src[y * width + x]) * wx * wy;
+    dst[y * width + x] = v;
+}
+
+// u8 -> float 変換（R2C入力用）＋2Dハン窓を適用してリークを低減
 __global__ void u8_to_float_window(float* src, float* dst, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;

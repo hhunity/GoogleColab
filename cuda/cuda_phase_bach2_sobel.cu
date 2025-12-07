@@ -303,9 +303,9 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaStreamCreate(&h2d_stream));
 
     // input img (PFM top-down)
-    PFMImage img1, img2;
-    if (!read_pfm("img_1.pfm", img1)) return 1;
-    if (!read_pfm("img_2.pfm", img2)) return 1;
+    Image img1, img2;
+    if (!read_pgm("img_1.pfm", img1)) return 1;
+    if (!read_pgm("img_2.pfm", img2)) return 1;
     if (img1.width != img2.width || img1.height != img2.height) {
         std::fprintf(stderr, "Input sizes mismatch\n");
         return 1;
@@ -315,10 +315,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     CHECK_CUDA(cudaHostRegister(img1.data.data(),
-                                img1.data.size() * sizeof(float),
+                                img1.data.size() * sizeof(unsigned char),
                                 cudaHostRegisterDefault));
     CHECK_CUDA(cudaHostRegister(img2.data.data(),
-                                img2.data.size() * sizeof(float),
+                                img2.data.size() * sizeof(unsigned char),
                                 cudaHostRegisterDefault));
 
     const int tile_w = img1.width / split_x;
@@ -365,11 +365,11 @@ int main(int argc, char** argv) {
     }
 
     // デバイスバッファ（タイル全体分）
+    unsigned char* d_img1_full[2] = {nullptr, nullptr};
+    unsigned char* d_img2_full[2] = {nullptr, nullptr};
+    unsigned char* d_sobel_out[2]     = {nullptr, nullptr};;
     float* d_mag_f[2]   = {nullptr, nullptr};;
     float* d_sobel_f[2] = {nullptr, nullptr};;
-    float* d_dst[2]     = {nullptr, nullptr};;
-    float* d_img1_full[2] = {nullptr, nullptr};
-    float* d_img2_full[2] = {nullptr, nullptr};
     float* d_img1[2] = {nullptr, nullptr}; // デバッグ用にバッチ連続の実数タイルを保持
     float* d_corr[2] = {nullptr, nullptr};
     Peak* d_block_peaks[2] = {nullptr, nullptr};
@@ -379,11 +379,10 @@ int main(int argc, char** argv) {
     int peak_blocks = (tile_pixels + peak_threads - 1) / peak_threads;
     size_t batch_pixels = static_cast<size_t>(tile_pixels) * batch;
     for (int b = 0; b < 2; ++b) {
-        CHECK_CUDA(cudaMalloc(&d_img1_full[b], static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_img2_full[b], static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_img1_full[b], static_cast<size_t>(img1.width) * img1.height * sizeof(unsigned char)));
+        CHECK_CUDA(cudaMalloc(&d_img2_full[b], static_cast<size_t>(img2.width) * img2.height * sizeof(unsigned char)));
+        CHECK_CUDA(cudaMalloc(&d_sobel_out[b], static_cast<size_t>(img1.width) * img1.height * sizeof(unsigned char)));
         CHECK_CUDA(cudaMalloc(&d_mag_f[b], static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_dst[b], static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_img2_full[b], static_cast<size_t>(img2.width) * img2.height * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_img1[b], batch_pixels * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_corr[b], batch_pixels * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_block_peaks[b], peak_blocks * sizeof(Peak)));
@@ -465,20 +464,20 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventCreate(&h2d_ready[1]));
 
     for (int i = 0; i < 2; i++) {
-        cudaStream_t stream = streams[0];
+        cudaStream_t stream = streams[i];
         CHECK_CUDA(cudaMemcpyAsync(d_img2_full[i], img2.data.data(),
-                                   static_cast<size_t>(img2.width) * img2.height * sizeof(float),
+                                   static_cast<size_t>(img2.width) * img2.height * sizeof(unsigned char),
                                    cudaMemcpyHostToDevice, stream));
-        rotate_origin<<<grid, block, 0, stream>>>(d_img2_full[i], d_dst[i], img.width, img.height, angle_rad);
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_dst[i], d_mag_f[i], img.width, img.height);
-        u8_to_float_window<<<grid2, block2, 0, stream>>>(d_mag_f[i], d_sobel_f[i], img.width, img.height);
+        rotate_origin<<<grid, block, 0, stream>>>(d_img2_full[i], d_sobel_out[i], img.width, img.height, angle_rad);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_mag_f[i], img.width, img.height);
+        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[i], d_sobel_f[i], img.width, img.height);
 #ifdef USE_TILE_MASK
         pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full[i], d_active_tiles, batch,
                                                                   d_fft2[i],
                                                                   img2.width, img2.height,
                                                                   tile_w, tile_h, split_x, split_y);
 #else
-        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img2_full[i], d_fft2[i],
+        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_sobel_f[i], d_fft2[i],
                                                            img2.width, img2.height,
                                                            tile_w, tile_h, split_x, split_y);
 #endif
@@ -486,7 +485,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
             return 1;
         }
-        CHECK_CUDA(cudaStreamSynchronize(streams[0]));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
     }
     
     auto t_all_start = std::chrono::steady_clock::now();
@@ -496,7 +495,7 @@ int main(int argc, char** argv) {
         cudaStream_t stream = streams[buf];
         // H2D は専用ストリームで前倒しし、イベントで待つ
         CHECK_CUDA(cudaMemcpyAsync(d_img1_full[buf], img1.data.data(),
-                                   static_cast<size_t>(img1.width) * img1.height * sizeof(float),
+                                   static_cast<size_t>(img1.width) * img1.height * sizeof(unsigned char),
                                    cudaMemcpyHostToDevice, stream));
         // //このストリーム上のここまでで、イベントが完了しtら転送完了フラグを立てる
         // CHECK_CUDA(cudaEventRecord(h2d_ready[buf], h2d_stream));
@@ -509,6 +508,9 @@ int main(int argc, char** argv) {
                                                                   img1.width, img1.height,
                                                                   tile_w, tile_h, split_x, split_y);
 #else
+        rotate_origin<<<grid, block, 0, stream>>>(d_img1_full[buf], d_sobel_out[buf], img.width, img.height, angle_rad);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[buf], d_mag_f[buf], img.width, img.height);
+        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[buf], d_sobel_f[buf], img.width, img.height);
         pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img1_full[buf], d_fft1[buf],
                                                            img1.width, img1.height,
                                                            tile_w, tile_h, split_x, split_y);
@@ -619,7 +621,7 @@ int main(int argc, char** argv) {
     for (int b = 0; b < 2; ++b) {
         cufftDestroy(fft_plan[b]);
         cufftDestroy(ifft_plan[b]);
-        cudaFree(d_dst[b]);
+        cudaFree(d_sobel_out[b]);
         cudaFree(d_mag_f[b]);
         cudaFree(d_sobel_f[b]);
         cudaFree(d_fft1[b]);
