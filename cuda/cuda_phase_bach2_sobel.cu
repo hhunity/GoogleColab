@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cufft.h>
 #include "pfm_io.h"
+#include "pgm_io.h"
 #include "cuda_kernels.cuh"
 
 void save_pfm(const std::string& path, const cufftComplex* src, int width, int height, int c = 3) {
@@ -304,8 +305,8 @@ int main(int argc, char** argv) {
 
     // input img (PFM top-down)
     Image img1, img2;
-    if (!read_pgm("img_1.pfm", img1)) return 1;
-    if (!read_pgm("img_2.pfm", img2)) return 1;
+    if (!read_pgm("img_1.pgm", img1)) return 1;
+    if (!read_pgm("img_2.pgm", img2)) return 1;
     if (img1.width != img2.width || img1.height != img2.height) {
         std::fprintf(stderr, "Input sizes mismatch\n");
         return 1;
@@ -383,6 +384,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMalloc(&d_img2_full[b], static_cast<size_t>(img2.width) * img2.height * sizeof(unsigned char)));
         CHECK_CUDA(cudaMalloc(&d_sobel_out[b], static_cast<size_t>(img1.width) * img1.height * sizeof(unsigned char)));
         CHECK_CUDA(cudaMalloc(&d_mag_f[b], static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_sobel_f[b], static_cast<size_t>(img1.width) * img1.height * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_img1[b], batch_pixels * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_corr[b], batch_pixels * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_block_peaks[b], peak_blocks * sizeof(Peak)));
@@ -448,10 +450,8 @@ int main(int argc, char** argv) {
     dim3 grid((tile_w + block.x - 1) / block.x, (tile_h + block.y - 1) / block.y);
     dim3 grid3(grid.x, grid.y, batch);
     dim3 block2(16, 16);
-    dim3 grid2((img.width + block2.x - 1) / block2.x,
-                (img.height + block2.y - 1) / block2.y);
-    dim3 grid_full((fft_w + block2.x - 1) / block2.x,
-                (fft_h + block2.y - 1) / block2.y);
+    dim3 grid2((img1.width + block2.x - 1) / block2.x,
+                (img1.height + block2.y - 1) / block2.y);
     Peak* peaks_host[2] = {nullptr, nullptr};
     Centroid* cent_host[2] = {nullptr, nullptr};
     CHECK_CUDA(cudaHostAlloc(&peaks_host[0], static_cast<size_t>(batch) * sizeof(Peak), cudaHostAllocDefault));
@@ -468,9 +468,9 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpyAsync(d_img2_full[i], img2.data.data(),
                                    static_cast<size_t>(img2.width) * img2.height * sizeof(unsigned char),
                                    cudaMemcpyHostToDevice, stream));
-        rotate_origin<<<grid, block, 0, stream>>>(d_img2_full[i], d_sobel_out[i], img.width, img.height, angle_rad);
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_mag_f[i], img.width, img.height);
-        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[i], d_sobel_f[i], img.width, img.height);
+        rotate_origin<<<grid2, block2, 0, stream>>>(d_img2_full[i], d_sobel_out[i], img1.width, img1.height, 0.0);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_mag_f[i], img1.width, img1.height);
+        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[i], d_sobel_f[i], img1.width, img1.height);
 #ifdef USE_TILE_MASK
         pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full[i], d_active_tiles, batch,
                                                                   d_fft2[i],
@@ -480,6 +480,13 @@ int main(int argc, char** argv) {
         pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_sobel_f[i], d_fft2[i],
                                                            img2.width, img2.height,
                                                            tile_w, tile_h, split_x, split_y);
+        if(1) {
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            // save_pfm_real("cuda_rotate_out.pfm", d_sobel_out,img1.width, img1.height);
+            save_pfm_real("b_cuda_sobel_out.pfm", d_mag_f[i],img1.width, img1.height);
+            save_pfm_real("b_cuda_hann_window_out.pfm", d_sobel_f[i], img1.width, img1.height);
+            save_pfm("b_cuda_tiles_out.pfm", d_fft2[i], tile_w, tile_h*batch,1);
+        }
 #endif
         if (cufftExecC2C(fft_plan[i], d_fft2[i], d_fft2[i], CUFFT_FORWARD) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
@@ -508,12 +515,19 @@ int main(int argc, char** argv) {
                                                                   img1.width, img1.height,
                                                                   tile_w, tile_h, split_x, split_y);
 #else
-        rotate_origin<<<grid, block, 0, stream>>>(d_img1_full[buf], d_sobel_out[buf], img.width, img.height, angle_rad);
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[buf], d_mag_f[buf], img.width, img.height);
-        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[buf], d_sobel_f[buf], img.width, img.height);
-        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_img1_full[buf], d_fft1[buf],
+        rotate_origin<<<grid2, block2, 0, stream>>>(d_img1_full[buf], d_sobel_out[buf], img1.width, img1.height, 0.0);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[buf], d_mag_f[buf], img1.width, img1.height);
+        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[buf], d_sobel_f[buf], img1.width, img1.height);
+        pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_sobel_f[buf], d_fft1[buf],
                                                            img1.width, img1.height,
                                                            tile_w, tile_h, split_x, split_y);
+        if(1) {
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            // save_pfm_real("cuda_rotate_out.pfm", d_sobel_out,img1.width, img1.height);
+            save_pfm_real("cuda_sobel_out.pfm", d_mag_f[buf],img1.width, img1.height);
+            save_pfm_real("cuda_hann_window_out.pfm", d_sobel_f[buf], img1.width, img1.height);
+            save_pfm("cuda_tiles_out.pfm", d_fft1[buf], tile_w, tile_h*batch,1);
+        }
 #endif
         if (cufftExecC2C(fft_plan[buf], d_fft1[buf], d_fft1[buf], CUFFT_FORWARD) != CUFFT_SUCCESS) {
             std::fprintf(stderr, "cufftExecC2C forward failed\n");
