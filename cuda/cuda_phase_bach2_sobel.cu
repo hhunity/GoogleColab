@@ -87,7 +87,7 @@ __global__ void pack_tiles_masked(const float* src, float* dst,
     dst[dst_idx] = src[src_idx];
 }
 
-// pack + 実→複素を一度に行う
+// pack + 実→複素を一度に行う（タイル内で2Dハン窓を適用）
 __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
                                       int width, int height,
                                       int tile_w, int tile_h,
@@ -104,11 +104,20 @@ __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    dst[dst_idx].x = src[src_idx];
+    const float pi = 3.1415926535f;
+    float wx = 1.0f;
+    float wy = 1.0f;
+    if (tile_w > 1) {
+        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
+    }
+    if (tile_h > 1) {
+        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
+    }
+    dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
 
-// マスク付き: 有効タイルリストを使って複素へ詰める
+// マスク付き: 有効タイルリストを使って複素へ詰める（タイル内で2Dハン窓を適用）
 __global__ void pack_tiles_to_complex_masked(const float* src, const int* tile_indices, int num_tiles,
                                              cufftComplex* dst,
                                              int width, int height,
@@ -126,7 +135,16 @@ __global__ void pack_tiles_to_complex_masked(const float* src, const int* tile_i
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    dst[dst_idx].x = src[src_idx];
+    const float pi = 3.1415926535f;
+    float wx = 1.0f;
+    float wy = 1.0f;
+    if (tile_w > 1) {
+        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
+    }
+    if (tile_h > 1) {
+        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
+    }
+    dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
 
@@ -468,22 +486,22 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpyAsync(d_img2_full[i], img2.data.data(),
                                    static_cast<size_t>(img2.width) * img2.height * sizeof(unsigned char),
                                    cudaMemcpyHostToDevice, stream));
-        rotate_origin<<<grid2, block2, 0, stream>>>(d_img2_full[i], d_sobel_out[i], img1.width, img1.height, 0.0);
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_mag_f[i], img1.width, img1.height);
-        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[i], d_sobel_f[i], img1.width, img1.height);
 #ifdef USE_TILE_MASK
         pack_tiles_to_complex_masked<<<grid3, block, 0, stream>>>(d_img2_full[i], d_active_tiles, batch,
                                                                   d_fft2[i],
                                                                   img2.width, img2.height,
                                                                   tile_w, tile_h, split_x, split_y);
 #else
+        rotate_origin<<<grid2, block2, 0, stream>>>(d_img2_full[i], d_sobel_out[i], img1.width, img1.height, 0.0);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_sobel_f[i], img1.width, img1.height);
+        // float_hann_window<<<grid2, block2, 0, stream>>>(d_sobel_out[i], d_sobel_f[i], img1.width, img1.height);
         pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_sobel_f[i], d_fft2[i],
                                                            img2.width, img2.height,
                                                            tile_w, tile_h, split_x, split_y);
-        if(1) {
+        if(debug) {
             CHECK_CUDA(cudaStreamSynchronize(stream));
             // save_pfm_real("cuda_rotate_out.pfm", d_sobel_out,img1.width, img1.height);
-            save_pfm_real("b_cuda_sobel_out.pfm", d_mag_f[i],img1.width, img1.height);
+            // save_pfm_real("b_cuda_sobel_out.pfm", d_mag_f[i],img1.width, img1.height);
             save_pfm_real("b_cuda_hann_window_out.pfm", d_sobel_f[i], img1.width, img1.height);
             save_pfm("b_cuda_tiles_out.pfm", d_fft2[i], tile_w, tile_h*batch,1);
         }
@@ -516,15 +534,15 @@ int main(int argc, char** argv) {
                                                                   tile_w, tile_h, split_x, split_y);
 #else
         rotate_origin<<<grid2, block2, 0, stream>>>(d_img1_full[buf], d_sobel_out[buf], img1.width, img1.height, 0.0);
-        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[buf], d_mag_f[buf], img1.width, img1.height);
-        float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[buf], d_sobel_f[buf], img1.width, img1.height);
+        sobel3x3_mag<<<grid2, block2, 0, stream>>>(d_sobel_out[buf], d_sobel_f[buf], img1.width, img1.height);
+        // float_hann_window<<<grid2, block2, 0, stream>>>(d_mag_f[buf], d_sobel_f[buf], img1.width, img1.height);
         pack_tiles_to_complex<<<grid3, block, 0, stream>>>(d_sobel_f[buf], d_fft1[buf],
                                                            img1.width, img1.height,
                                                            tile_w, tile_h, split_x, split_y);
-        if(1) {
+        if(debug) {
             CHECK_CUDA(cudaStreamSynchronize(stream));
             // save_pfm_real("cuda_rotate_out.pfm", d_sobel_out,img1.width, img1.height);
-            save_pfm_real("cuda_sobel_out.pfm", d_mag_f[buf],img1.width, img1.height);
+            // save_pfm_real("cuda_sobel_out.pfm", d_mag_f[buf],img1.width, img1.height);
             save_pfm_real("cuda_hann_window_out.pfm", d_sobel_f[buf], img1.width, img1.height);
             save_pfm("cuda_tiles_out.pfm", d_fft1[buf], tile_w, tile_h*batch,1);
         }
