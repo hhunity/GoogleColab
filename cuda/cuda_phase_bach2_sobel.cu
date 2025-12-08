@@ -637,6 +637,7 @@ int main(int argc, char** argv) {
         for (int b = 0; b < batch; ++b) {
             const float* corr_tile = d_corr[buf] + static_cast<size_t>(b) * tile_pixels;
             block_peak<<<peak_blocks, peak_threads, shared_bytes, stream>>>(corr_tile, tile_pixels, d_block_peaks[buf]);
+            CHECK_CUDA(cudaMemsetAsync(d_centroids[buf] + b, 0, sizeof(Centroid), stream));
             final_peak_and_centroid<<<1, peak_threads, shared_bytes, stream>>>(d_block_peaks[buf], peak_blocks,
                                                                                corr_tile, tile_w, tile_h,
                                                                                d_final_peaks[buf] + b, d_centroids[buf] + b);
