@@ -87,6 +87,11 @@ __global__ void pack_tiles_masked(const float* src, float* dst,
     dst[dst_idx] = src[src_idx];
 }
 
+// タイル内ハン窓（1次元）を事前計算して常駐させる
+#define MAX_TILE_DIM 512
+__constant__ float c_hann_x[MAX_TILE_DIM];
+__constant__ float c_hann_y[MAX_TILE_DIM];
+
 // pack + 実→複素を一度に行う（タイル内で2Dハン窓を適用）
 __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
                                       int width, int height,
@@ -104,15 +109,8 @@ __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    const float pi = 3.1415926535f;
-    float wx = 1.0f;
-    float wy = 1.0f;
-    if (tile_w > 1) {
-        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
-    }
-    if (tile_h > 1) {
-        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
-    }
+    float wx = c_hann_x[x];
+    float wy = c_hann_y[y];
     dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
@@ -135,15 +133,8 @@ __global__ void pack_tiles_to_complex_masked(const float* src, const int* tile_i
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    const float pi = 3.1415926535f;
-    float wx = 1.0f;
-    float wy = 1.0f;
-    if (tile_w > 1) {
-        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
-    }
-    if (tile_h > 1) {
-        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
-    }
+    float wx = c_hann_x[x];
+    float wy = c_hann_y[y];
     dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
@@ -382,6 +373,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "No active tiles selected\n");
         return 1;
     }
+    if (tile_w > MAX_TILE_DIM || tile_h > MAX_TILE_DIM) {
+        std::fprintf(stderr, "tile size exceeds MAX_TILE_DIM (%d)\n", MAX_TILE_DIM);
+        return 1;
+    }
+    std::vector<float> hann_x(tile_w), hann_y(tile_h);
+    if (tile_w > 1) {
+        for (int x = 0; x < tile_w; ++x) {
+            hann_x[x] = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * x / (tile_w - 1)));
+        }
+    } else {
+        hann_x[0] = 1.0f;
+    }
+    if (tile_h > 1) {
+        for (int y = 0; y < tile_h; ++y) {
+            hann_y[y] = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * y / (tile_h - 1)));
+        }
+    } else {
+        hann_y[0] = 1.0f;
+    }
+    CHECK_CUDA(cudaMemcpyToSymbol(c_hann_x, hann_x.data(), static_cast<size_t>(tile_w) * sizeof(float)));
+    CHECK_CUDA(cudaMemcpyToSymbol(c_hann_y, hann_y.data(), static_cast<size_t>(tile_h) * sizeof(float)));
 
     // デバイスバッファ（タイル全体分）
     unsigned char* d_img1_full[2] = {nullptr, nullptr};
