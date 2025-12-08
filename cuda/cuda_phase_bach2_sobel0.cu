@@ -87,11 +87,6 @@ __global__ void pack_tiles_masked(const float* src, float* dst,
     dst[dst_idx] = src[src_idx];
 }
 
-// タイル内ハン窓（1次元）を事前計算して常駐させる
-#define MAX_TILE_DIM 512
-__constant__ float c_hann_x[MAX_TILE_DIM];
-__constant__ float c_hann_y[MAX_TILE_DIM];
-
 // pack + 実→複素を一度に行う（タイル内で2Dハン窓を適用）
 __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
                                       int width, int height,
@@ -109,8 +104,15 @@ __global__ void pack_tiles_to_complex(const float* src, cufftComplex* dst,
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    float wx = c_hann_x[x];
-    float wy = c_hann_y[y];
+    const float pi = 3.1415926535f;
+    float wx = 1.0f;
+    float wy = 1.0f;
+    if (tile_w > 1) {
+        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
+    }
+    if (tile_h > 1) {
+        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
+    }
     dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
@@ -133,8 +135,15 @@ __global__ void pack_tiles_to_complex_masked(const float* src, const int* tile_i
     if (src_x >= width || src_y >= height) return;
     size_t src_idx = static_cast<size_t>(src_y) * width + src_x;
     size_t dst_idx = static_cast<size_t>(b) * tile_w * tile_h + static_cast<size_t>(y) * tile_w + x;
-    float wx = c_hann_x[x];
-    float wy = c_hann_y[y];
+    const float pi = 3.1415926535f;
+    float wx = 1.0f;
+    float wy = 1.0f;
+    if (tile_w > 1) {
+        wx = 0.5f * (1.0f - cosf(2.0f * pi * x / (tile_w - 1)));
+    }
+    if (tile_h > 1) {
+        wy = 0.5f * (1.0f - cosf(2.0f * pi * y / (tile_h - 1)));
+    }
     dst[dst_idx].x = src[src_idx] * wx * wy;
     dst[dst_idx].y = 0.0f;
 }
@@ -143,7 +152,12 @@ __global__ void pack_tiles_to_complex_masked(const float* src, const int* tile_i
 __global__ void final_peak_and_centroid(const Peak* block_peaks, int block_count,
                                         const float* corr, int width, int height,
                                         Peak* out_peak, Centroid* out_centroid) {
+    extern __shared__ float s_mem[];
+    float* s_val = s_mem;
+    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
     int tid = threadIdx.x;
+
+    // 複数blockの代表値から最大を探す（ストライド付きで走査）
     float best_val = -1e30f;
     int best_idx = 0;
     for (int i = tid; i < block_count; i += blockDim.x) {
@@ -153,44 +167,25 @@ __global__ void final_peak_and_centroid(const Peak* block_peaks, int block_count
             best_idx = block_peaks[i].idx;
         }
     }
-    unsigned mask = 0xffffffff;
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        float v = __shfl_down_sync(mask, best_val, offset);
-        int id = __shfl_down_sync(mask, best_idx, offset);
-        if (v > best_val) {
-            best_val = v;
-            best_idx = id;
-        }
-    }
-    __shared__ float warp_val[32];
-    __shared__ int warp_idx[32];
-    int lane = tid & (warpSize - 1);
-    int warp = tid / warpSize;
-    if (lane == 0) {
-        warp_val[warp] = best_val;
-        warp_idx[warp] = best_idx;
-    }
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
     __syncthreads();
-    if (warp == 0) {
-        int warp_count = (blockDim.x + warpSize - 1) / warpSize;
-        float v = (lane < warp_count) ? warp_val[lane] : -1e30f;
-        int id = (lane < warp_count) ? warp_idx[lane] : 0;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            float vv = __shfl_down_sync(mask, v, offset);
-            int iid = __shfl_down_sync(mask, id, offset);
-            if (vv > v) {
-                v = vv;
-                id = iid;
+
+    // block内リダクションで全体最大を決定
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            if (s_val[tid + offset] > s_val[tid]) {
+                s_val[tid] = s_val[tid + offset];
+                s_idx[tid] = s_idx[tid + offset];
             }
         }
-        if (lane == 0) {
-            out_peak->val = v;
-            out_peak->idx = id;
-        }
+        __syncthreads();
     }
-    __syncthreads();
+
     if (tid == 0) {
-        int peak_idx = out_peak->idx;
+        out_peak->val = s_val[0];
+        out_peak->idx = s_idx[0];
+        int peak_idx = s_idx[0];
         int px = peak_idx % width;
         int py = peak_idx / width;
         float m00 = 0.0f, m10 = 0.0f, m01 = 0.0f;
@@ -216,6 +211,9 @@ __global__ void final_peak_and_centroid(const Peak* block_peaks, int block_count
 // d_corr を介さず、センタシフト＋ピーク＋重心まで一括で行う
 __global__ void block_peak_shifted(const cufftComplex* src, int width, int height,
                                    size_t tile_offset, Peak* block_out) {
+    extern __shared__ float s_mem[];
+    float* s_val = s_mem;
+    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
     float v = -1e30f;
@@ -228,40 +226,21 @@ __global__ void block_peak_shifted(const cufftComplex* src, int width, int heigh
         size_t pos = tile_offset + static_cast<size_t>(sy) * width + sx;
         v = src[pos].x; // IFFT出力の実部
     }
-    unsigned mask = 0xffffffff;
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        float vv = __shfl_down_sync(mask, v, offset);
-        int iid = __shfl_down_sync(mask, id, offset);
-        if (vv > v) {
-            v = vv;
-            id = iid;
-        }
-    }
-    __shared__ float warp_val[32];
-    __shared__ int warp_idx[32];
-    int lane = tid & (warpSize - 1);
-    int warp = tid / warpSize;
-    if (lane == 0) {
-        warp_val[warp] = v;
-        warp_idx[warp] = id;
-    }
+    s_val[tid] = v;
+    s_idx[tid] = id;
     __syncthreads();
-    if (warp == 0) {
-        int warp_count = (blockDim.x + warpSize - 1) / warpSize;
-        float val = (lane < warp_count) ? warp_val[lane] : -1e30f;
-        int idx2 = (lane < warp_count) ? warp_idx[lane] : 0;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            float vv = __shfl_down_sync(mask, val, offset);
-            int iid = __shfl_down_sync(mask, idx2, offset);
-            if (vv > val) {
-                val = vv;
-                idx2 = iid;
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            if (s_val[tid + offset] > s_val[tid]) {
+                s_val[tid] = s_val[tid + offset];
+                s_idx[tid] = s_idx[tid + offset];
             }
         }
-        if (lane == 0) {
-            block_out[blockIdx.x].val = val;
-            block_out[blockIdx.x].idx = idx2;
-        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        block_out[blockIdx.x].val = s_val[0];
+        block_out[blockIdx.x].idx = s_idx[0];
     }
 }
 
@@ -269,7 +248,11 @@ __global__ void final_peak_and_centroid_shifted(const Peak* block_peaks, int blo
                                                 const cufftComplex* fft, int width, int height,
                                                 size_t tile_offset, float scale,
                                                 Peak* out_peak, Centroid* out_centroid) {
+    extern __shared__ float s_mem[];
+    float* s_val = s_mem;
+    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
     int tid = threadIdx.x;
+
     float best_val = -1e30f;
     int best_idx = 0;
     for (int i = tid; i < block_count; i += blockDim.x) {
@@ -279,44 +262,24 @@ __global__ void final_peak_and_centroid_shifted(const Peak* block_peaks, int blo
             best_idx = block_peaks[i].idx;
         }
     }
-    unsigned mask = 0xffffffff;
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        float v = __shfl_down_sync(mask, best_val, offset);
-        int id = __shfl_down_sync(mask, best_idx, offset);
-        if (v > best_val) {
-            best_val = v;
-            best_idx = id;
-        }
-    }
-    __shared__ float warp_val[32];
-    __shared__ int warp_idx[32];
-    int lane = tid & (warpSize - 1);
-    int warp = tid / warpSize;
-    if (lane == 0) {
-        warp_val[warp] = best_val;
-        warp_idx[warp] = best_idx;
-    }
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
     __syncthreads();
-    if (warp == 0) {
-        int warp_count = (blockDim.x + warpSize - 1) / warpSize;
-        float v = (lane < warp_count) ? warp_val[lane] : -1e30f;
-        int id = (lane < warp_count) ? warp_idx[lane] : 0;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            float vv = __shfl_down_sync(mask, v, offset);
-            int iid = __shfl_down_sync(mask, id, offset);
-            if (vv > v) {
-                v = vv;
-                id = iid;
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            if (s_val[tid + offset] > s_val[tid]) {
+                s_val[tid] = s_val[tid + offset];
+                s_idx[tid] = s_idx[tid + offset];
             }
         }
-        if (lane == 0) {
-            out_peak->val = v;
-            out_peak->idx = id;
-        }
+        __syncthreads();
     }
-    __syncthreads();
+
     if (tid == 0) {
-        int peak_idx = out_peak->idx;
+        out_peak->val = s_val[0];
+        out_peak->idx = s_idx[0];
+        int peak_idx = s_idx[0];
         int px = peak_idx % width;
         int py = peak_idx / width;
         float m00 = 0.0f, m10 = 0.0f, m01 = 0.0f;
@@ -419,27 +382,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "No active tiles selected\n");
         return 1;
     }
-    if (tile_w > MAX_TILE_DIM || tile_h > MAX_TILE_DIM) {
-        std::fprintf(stderr, "tile size exceeds MAX_TILE_DIM (%d)\n", MAX_TILE_DIM);
-        return 1;
-    }
-    std::vector<float> hann_x(tile_w), hann_y(tile_h);
-    if (tile_w > 1) {
-        for (int x = 0; x < tile_w; ++x) {
-            hann_x[x] = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * x / (tile_w - 1)));
-        }
-    } else {
-        hann_x[0] = 1.0f;
-    }
-    if (tile_h > 1) {
-        for (int y = 0; y < tile_h; ++y) {
-            hann_y[y] = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * y / (tile_h - 1)));
-        }
-    } else {
-        hann_y[0] = 1.0f;
-    }
-    CHECK_CUDA(cudaMemcpyToSymbol(c_hann_x, hann_x.data(), static_cast<size_t>(tile_w) * sizeof(float)));
-    CHECK_CUDA(cudaMemcpyToSymbol(c_hann_y, hann_y.data(), static_cast<size_t>(tile_h) * sizeof(float)));
 
     // デバイスバッファ（タイル全体分）
     unsigned char* d_img1_full[2] = {nullptr, nullptr};

@@ -334,40 +334,50 @@ __global__ void scale_and_shift(const float* src, float* dst, int width, int hei
 //      └ 同一ブロック内の全スレッドがこの地点に到達するまで待つバリア。これ以前の共有メモリ書き込みが全員完了してから次に進むための安全装置。
 //      └ リダクションの各ステップごとに入れているのは、更新が終わっていないデータを他スレッドが読まないようにするため。
 __global__ void block_peak(const float* src, int n, Peak* block_out) {
-    extern __shared__ float s_mem[];
-    float* s_val = s_mem;
-    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
-    float v = -1e30f;
+    float v = (idx < n) ? src[idx] : -1e30f;
     int id = idx;
-    if (idx < n) {
-        v = src[idx];
+    unsigned mask = 0xffffffff;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        float vv = __shfl_down_sync(mask, v, offset);
+        int iid = __shfl_down_sync(mask, id, offset);
+        if (vv > v) {
+            v = vv;
+            id = iid;
+        }
     }
-    s_val[tid] = v; // 共有メモリに値と元インデックスを詰める（速いローカルキャッシュとして使う）
-    s_idx[tid] = id;
-    __syncthreads(); // 全スレッドのロード完了を同期（これ以前のデータ書き込みが全員済むのを待つ）
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) { // 木構造の最大値リダクション（半分ずつ潰す）
-        if (tid < offset) {
-            if (s_val[tid + offset] > s_val[tid]) {
-                s_val[tid] = s_val[tid + offset];
-                s_idx[tid] = s_idx[tid + offset];
+    __shared__ float warp_val[32];
+    __shared__ int warp_idx[32];
+    int lane = tid & (warpSize - 1);
+    int warp = tid / warpSize;
+    if (lane == 0) {
+        warp_val[warp] = v;
+        warp_idx[warp] = id;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+        float val = (lane < warp_count) ? warp_val[lane] : -1e30f;
+        int idx2 = (lane < warp_count) ? warp_idx[lane] : 0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            float vv = __shfl_down_sync(mask, val, offset);
+            int iid = __shfl_down_sync(mask, idx2, offset);
+            if (vv > val) {
+                val = vv;
+                idx2 = iid;
             }
         }
-        __syncthreads(); // 次段に進む前に全スレッドを揃える（同期しないと別スレッドがまだ更新中かもしれない）
-    }
-    if (tid == 0) {
-        block_out[blockIdx.x].val = s_val[0];
-        block_out[blockIdx.x].idx = s_idx[0];
+        if (lane == 0) {
+            block_out[blockIdx.x].val = val;
+            block_out[blockIdx.x].idx = idx2;
+        }
     }
 }
 
 // ブロック最大値の配列をさらに縮約して全体の最大値を求める（手順は block_peak と同じ）。
 // ここでも共有メモリに一旦集め、__syncthreads でバリアを挟みつつ木構造リダクションで1要素まで畳む。
 __global__ void reduce_peak(const Peak* src, int n, Peak* out) {
-    extern __shared__ float s_mem[];
-    float* s_val = s_mem;
-    int* s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
     float v = -1e30f;
@@ -376,21 +386,40 @@ __global__ void reduce_peak(const Peak* src, int n, Peak* out) {
         v = src[idx].val;
         id = src[idx].idx;
     }
-    s_val[tid] = v; // 共有メモリに値と元インデックスを詰める
-    s_idx[tid] = id;
-    __syncthreads(); // __syncthreads は同一ブロックの全スレッドが揃うまで待つ
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) { // 木構造の最大値リダクション
-        if (tid < offset) {
-            if (s_val[tid + offset] > s_val[tid]) {
-                s_val[tid] = s_val[tid + offset];
-                s_idx[tid] = s_idx[tid + offset];
+    unsigned mask = 0xffffffff;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        float vv = __shfl_down_sync(mask, v, offset);
+        int iid = __shfl_down_sync(mask, id, offset);
+        if (vv > v) {
+            v = vv;
+            id = iid;
+        }
+    }
+    __shared__ float warp_val[32];
+    __shared__ int warp_idx[32];
+    int lane = tid & (warpSize - 1);
+    int warp = tid / warpSize;
+    if (lane == 0) {
+        warp_val[warp] = v;
+        warp_idx[warp] = id;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+        float val = (lane < warp_count) ? warp_val[lane] : -1e30f;
+        int idx2 = (lane < warp_count) ? warp_idx[lane] : 0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            float vv = __shfl_down_sync(mask, val, offset);
+            int iid = __shfl_down_sync(mask, idx2, offset);
+            if (vv > val) {
+                val = vv;
+                idx2 = iid;
             }
         }
-        __syncthreads(); // 次段へ進む前に全スレッドを同期
-    }
-    if (tid == 0) {
-        out[blockIdx.x].val = s_val[0];
-        out[blockIdx.x].idx = s_idx[0];
+        if (lane == 0) {
+            out[blockIdx.x].val = val;
+            out[blockIdx.x].idx = idx2;
+        }
     }
 }
 
