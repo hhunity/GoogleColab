@@ -5,6 +5,126 @@
 #include <mutex>
 #include <condition_variable>
 #include <iostream>
+
+__global__ void myKernel(float* data, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) data[idx] *= 2.0f;
+}
+
+struct GpuJob {
+    float* d_data;
+    int N;
+    std::promise<void> promise;
+};
+
+class CudaWorker {
+public:
+    CudaWorker() {
+        cudaStreamCreate(&stream_);
+        worker_ = std::thread(&CudaWorker::threadFunc, this);
+    }
+    ~CudaWorker() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        worker_.join();
+        cudaStreamDestroy(stream_);
+    }
+
+    std::future<void> submitJob(float* d_data, int N) {
+        GpuJob job;
+        job.d_data = d_data;
+        job.N = N;
+
+        std::future<void> fut = job.promise.get_future();
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            queue_.push(std::move(job));
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    static void CUDART_CB hostCallback(void* userData)
+    {
+        GpuJob* job = reinterpret_cast<GpuJob*>(userData);
+        job->promise.set_value();      // 完了通知
+        delete job;                    // 必要なら解放
+    }
+
+    void threadFunc() {
+        while (true) {
+            GpuJob* job = nullptr;
+
+            {   // 仕事取り出し
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait(lk, [&]{ return stop_ || !queue_.empty(); });
+                if (stop_) return;
+
+                job = new GpuJob(std::move(queue_.front()));
+                queue_.pop();
+            }
+
+            // -----------------------
+            // GPU 実行
+            // -----------------------
+            int block = 256;
+            int grid = (job->N + block - 1) / block;
+            myKernel<<<grid, block, 0, stream_>>>(job->d_data, job->N);
+
+            // -----------------------
+            // 完了時に呼ばれるコールバック
+            // -----------------------
+            cudaLaunchHostFunc(stream_, hostCallback, job);
+
+            // Worker は待たずに次の job へ
+        }
+    }
+
+    std::thread worker_;
+    cudaStream_t stream_;
+    std::queue<GpuJob> queue_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
+
+int main()
+{
+    const int N = 1024;
+    float* d_data;
+    cudaMalloc(&d_data, sizeof(float) * N);
+
+    float h_data[N];
+    std::fill(h_data, h_data + N, 1.0f);
+    cudaMemcpy(d_data, h_data, sizeof(float) * N, cudaMemcpyHostToDevice);
+
+    CudaWorker worker;
+    auto fut = worker.submitJob(d_data, N);
+
+    fut.get();  // 超低遅延で復帰する
+
+    cudaMemcpy(h_data, d_data, sizeof(float) * N, cudaMemcpyDeviceToHost);
+    std::cout << "h_data[0] = " << h_data[0] << std::endl;
+
+    cudaFree(d_data);
+    return 0;
+}
+
+
+
+#include <cuda_runtime.h>
+#include <thread>
+#include <queue>
+#include <future>
+#include <mutex>
+#include <condition_variable>
+#include <iostream>
 #include <chrono>
 
 // =====================================================
